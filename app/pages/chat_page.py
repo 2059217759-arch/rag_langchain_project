@@ -33,11 +33,11 @@ question = st.chat_input("请输入问题：")
 
 if question:
     st.chat_message("user").write(question)
+    # 将用户消息添加到会话历史中
     st.session_state.messages.append({"role": "user", "content": question})
 
-    res = st.session_state["rag"].get_chain().invoke(
-        {"question": question},
-        config={"configurable": {"session_id": st.session_state["username"]}},
+    res = st.session_state["rag"].invoke(
+        question, st.session_state["username"]
     )
     st.chat_message("assistant").write(res)
     st.session_state.messages.append({"role": "assistant", "content": res})

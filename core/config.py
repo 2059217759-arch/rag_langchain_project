@@ -23,6 +23,9 @@ MAX_SPLIT_CHAR_NUMBER = 1000
 # ── Chat Model ─────────────────────────────────────
 CHAT_MODEL_NAME = "qwen-max"
 
+# ── Chat Window ────────────────────────────────────
+WINDOW_SIZE = 10  # 滑动窗口保留最近消息条数（≈5轮问答）
+
 # ── MD5 Dedup ─────────────────────────────────────
 MD5_PATH = os.path.join(DATA_DIR, "md5.text")
 

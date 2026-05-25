@@ -64,7 +64,7 @@ def _init_db():
         if conn:
             conn.close()
 
-    # 2. 建表users
+    # 2. 建表
     conn = None
     try:
         conn = _make_connection(config.MYSQL_DATABASE)
@@ -77,6 +77,28 @@ def _init_db():
                     password    VARCHAR(256) NOT NULL,
                     created_at  DATETIME     DEFAULT CURRENT_TIMESTAMP,
                     updated_at  DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id          BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    session_id  VARCHAR(128) NOT NULL,
+                    message     JSON NOT NULL,
+                    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_session_id (session_id)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_summary (
+                    session_id              VARCHAR(128) PRIMARY KEY,
+                    summary                 TEXT,
+                    last_summarized_msg_id  BIGINT DEFAULT 0,
+                    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
