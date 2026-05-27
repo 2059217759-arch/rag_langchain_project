@@ -5,7 +5,7 @@
 ## 功能
 
 - **用户注册/登录** — JWT 认证 + bcrypt 密码哈希
-- **文件上传入库** — 文本文件自动分段 → 向量化 → ChromaDB，支持 MD5 去重
+- **文件上传入库** — 文本/Markdown 文件自动分段 → 向量化 → ChromaDB，支持 MD5 去重，父子块分层存储
 - **智能问答** — 基于上传文档的 RAG 检索增强生成
 - **滑动窗口上下文** — 只保留最近 K 条完整消息，避免上下文爆炸
 - **对话摘要** — 超出窗口的历史消息自动压缩为摘要，增量更新，恒定成本
@@ -36,7 +36,7 @@ rag_project/
 │   ├── database.py           # MySQL 连接池 + 自动建库建表
 │   ├── auth.py               # JWT 签发/解码 + bcrypt 密码管理
 │   ├── rag.py                # RAG 服务：检索链 + 摘要管理
-│   ├── ingestion.py          # 文档拆分 → 向量化入库 + MD5 去重
+│   ├── ingestion.py          # 父子块切分（Markdown 结构化）→ 向量化入库 + MD5 去重
 │   └── vector_store.py       # ChromaDB 向量存储封装
 ├── storage/
 │   └── chat_history.py       # MySQL 对话历史持久化 + 摘要存取
@@ -73,6 +73,15 @@ rag_project/
 | summary | TEXT | 旧消息的对话摘要 |
 | last_summarized_msg_id | BIGINT | 已摘要到的消息 ID 上限 |
 | updated_at | DATETIME | 最后更新 |
+
+### document_parents
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| parent_id | VARCHAR(32) PK | 父块 MD5 标识 |
+| parent_content | MEDIUMTEXT | 父块完整内容 |
+| parent_title | VARCHAR(500) | 章节标题（Markdown 标题行） |
+| source | VARCHAR(255) | 来源文件名 |
+| child_count | INT | 该父块包含的子块数 |
 
 ## 快速开始
 
@@ -112,7 +121,7 @@ streamlit run app/login_page.py
 
 1. 打开浏览器访问 `http://localhost:8501`
 2. 注册账号 → 登录
-3. 进入「文件上传」页面上传文本文件（.txt）
+3. 进入「文件上传」页面上传文本/Markdown 文件（.txt, .md）
 4. 进入「智能助手」页面，基于文档内容提问
 
 ## 上下文管理机制
@@ -153,13 +162,24 @@ AI: "xxx"
 WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗口的模型
 ```
 
+## 文档分块策略（v2.1.0）
+
+系统采用 **父子块（Parent-Child）分层策略**：
+
+- **父块切分**：优先按 Markdown 标题（`#` ~ `######`）识别章节边界；无标题时按段落空行切分；超长段落按句子边界强制截断。父块目标大小 ≤ 4000 字符，存入 MySQL `document_parents` 表。
+- **子块切分**：在每个父块内部按句子边界切分为 300 字符的小块，存入 ChromaDB 用于向量检索。
+- **检索流程**：query → ChromaDB 检索 top-8 子块 → 按父块去重 → 取 top-4 父块 → MySQL 查完整父块内容 → 拼入 LLM prompt。
+
 ## 配置参考
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
 | `CHAT_MODEL_NAME` | `qwen-max` | 对话模型 |
 | `WINDOW_SIZE` | `10` | 滑动窗口消息条数 |
-| `CHUNK_SIZE` | `1000` | 文档分段大小 |
-| `CHUNK_OVERLAP` | `100` | 分段重叠量 |
+| `PARENT_MAX_SIZE` | `4000` | 父块目标大小上限（字符） |
+| `CHILD_CHUNK_SIZE` | `300` | 子块大小（用于向量检索） |
+| `CHILD_CHUNK_OVERLAP` | `50` | 子块重叠量 |
+| `TOP_K_CHILDREN` | `8` | 检索子块数 |
+| `TOP_K_PARENTS` | `4` | 返回父块数 |
 | `COLLECTION_NAME` | `rag` | ChromaDB 集合名 |
 | `JWT_EXPIRE_HOURS` | `24` | Token 过期时间 |

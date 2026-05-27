@@ -19,7 +19,7 @@ st.title("📄 文本文件上传")
 
 os.makedirs(config.DATA_DIR + "/uploads", exist_ok=True)
 
-uploaded_file = st.file_uploader("选择文本文件", type=["txt"])
+uploaded_file = st.file_uploader("选择文本/Markdown 文件", type=["txt", "md"])
 
 if "ingestion" not in st.session_state:
     st.session_state["ingestion"] = IngestionService()

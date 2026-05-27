@@ -1,5 +1,29 @@
 # Changelog
 
+## [v2.1.0] — 2026-05-27
+
+### 新增
+
+- **父子块分层策略**：父块按 Markdown 标题 → 段落边界 → 句子截断三级切分，子块在父块内按句子切分（300 字符），用小粒度做精准检索、大粒度给 LLM 提供完整上下文
+- **`document_parents` 表**：父块存入 MySQL（`MEDIUMTEXT`），子块存入 ChromaDB，双层存储各司其职
+- **Markdown 文件上传**：上传页面支持 `.md` 文件，Markdown 标题自动识别为父块边界
+- **检索链重构**：top-8 子块 → `parent_id` 去重 → top-4 父块 → MySQL 查完整内容 → 拼入 prompt
+
+### 变更
+
+- **`core/ingestion.py`**：`RecursiveCharacterTextSplitter` 替换为自定义 `ParentChildSplitter`
+- **`core/rag.py`**：`format_docs` 改为 parent 去重 + MySQL 查询拼接逻辑
+- **`core/database.py`**：新增 `insert_parents()` / `get_parents_by_ids()` 函数
+- **`core/config.py`**：删除 `CHUNK_SIZE` / `CHUNK_OVERLAP` / `SEPARATORS` / `MAX_SPLIT_CHAR_NUMBER`，新增 `PARENT_MAX_SIZE` / `CHILD_CHUNK_SIZE` / `CHILD_CHUNK_OVERLAP` / `TOP_K_CHILDREN` / `TOP_K_PARENTS`
+- **`core/vector_store.py`**：top-k 从 2 提升到 8
+- **`app/pages/upload_page.py`**：文件类型从 `["txt"]` 扩展为 `["txt", "md"]`
+
+### 注意
+
+- 旧 ChromaDB 数据需清空重新摄入（collection 结构不兼容）
+
+---
+
 ## [v2.0.0] — 2026-05-25
 
 ### 新增

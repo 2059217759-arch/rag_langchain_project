@@ -14,11 +14,12 @@ os.environ["DASHSCOPE_API_KEY"] = DASHSCOPE_API_KEY or ""
 COLLECTION_NAME = "rag"
 PERSIST_DIRECTORY = os.path.join(DATA_DIR, "chroma_db")
 
-# ── Text Splitter ──────────────────────────────────
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 100
-SEPARATORS = ["\n\n", "\n", ".", "!", "?", "。", "！", "？", " ", ""]
-MAX_SPLIT_CHAR_NUMBER = 1000
+# ── Parent-Child Chunking ─────────────────────────
+PARENT_MAX_SIZE = 4000       # 父块超过此值触发二次切分
+CHILD_CHUNK_SIZE = 300       # 子块目标大小（字符）
+CHILD_CHUNK_OVERLAP = 50     # 子块重叠量
+TOP_K_CHILDREN = 8           # 检索时返回多少个子块
+TOP_K_PARENTS = 4            # 最终返回多少个父块给 LLM
 
 # ── Chat Model ─────────────────────────────────────
 CHAT_MODEL_NAME = "qwen-max"

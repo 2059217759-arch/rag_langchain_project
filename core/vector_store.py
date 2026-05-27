@@ -15,5 +15,5 @@ class VectorStoreService:
     def get_retriever(self):
         return self.vector_store.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 2},
+            search_kwargs={"k": config.TOP_K_CHILDREN},
         )

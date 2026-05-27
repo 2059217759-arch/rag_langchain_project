@@ -9,7 +9,7 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from operator import itemgetter
 
 from core import config
-from core.database import get_connection
+from core.database import get_connection, get_parents_by_ids
 from core.vector_store import VectorStoreService
 from storage.chat_history import MySQLChatMessageHistory
 
@@ -40,11 +40,36 @@ class RagService:
         def format_docs(docs: list[Document]) -> str:
             if not docs:
                 return "无相关参考资料"
-            formatted_list = [
-                f"文档片段：{doc.page_content}\n文档元数据：{doc.metadata}"
-                for doc in docs
-            ]
-            return "\n\n".join(formatted_list)
+
+            # 按 parent_id 去重，保留首次出现（相似度最高）
+            seen = set()
+            parent_ids = []
+            for doc in docs:
+                pid = doc.metadata.get("parent_id")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    parent_ids.append(pid)
+
+            # 取 top-k 个父块
+            parent_ids = parent_ids[:config.TOP_K_PARENTS]
+
+            # 从 MySQL 获取父块内容
+            parent_map = get_parents_by_ids(parent_ids)
+
+            # 按检索顺序拼接
+            formatted = []
+            for pid in parent_ids:
+                p = parent_map.get(pid)
+                if not p:
+                    continue
+                title = p.get("parent_title", "")
+                content = p.get("parent_content", "")
+                if title:
+                    formatted.append(f"{title}\n{content}")
+                else:
+                    formatted.append(content)
+
+            return "\n\n---\n\n".join(formatted) if formatted else "无相关参考资料"
 
         def _fetch_summary(input_dict: dict, config: RunnableConfig) -> str:
             session_id = config["configurable"]["session_id"]

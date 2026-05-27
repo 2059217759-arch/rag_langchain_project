@@ -102,7 +102,61 @@ def _init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS document_parents (
+                    parent_id       VARCHAR(32) PRIMARY KEY,
+                    parent_content  MEDIUMTEXT NOT NULL,
+                    parent_title    VARCHAR(500) DEFAULT '',
+                    source          VARCHAR(255) DEFAULT '',
+                    create_time     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    operator        VARCHAR(50) DEFAULT 'zhuohao',
+                    child_count     INT DEFAULT 0,
+                    INDEX idx_source (source)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
         conn.commit()
     finally:
         if conn:
             conn.close()
+
+
+def insert_parents(parents: list[dict]) -> None:
+    """批量插入父块到 document_parents 表。"""
+    if not parents:
+        return
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO document_parents
+                    (parent_id, parent_content, parent_title, source, create_time, operator, child_count)
+                VALUES (%(parent_id)s, %(parent_content)s, %(parent_title)s,
+                        %(source)s, %(create_time)s, %(operator)s, %(child_count)s)
+                """,
+                parents,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_parents_by_ids(parent_ids: list[str]) -> dict:
+    """按 parent_id 列表查询父块，返回 {parent_id: row} 字典。"""
+    if not parent_ids:
+        return {}
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(parent_ids))
+            cur.execute(
+                f"SELECT parent_id, parent_content, parent_title, source "
+                f"FROM document_parents WHERE parent_id IN ({placeholders})",
+                parent_ids,
+            )
+            rows = cur.fetchall()
+        return {row["parent_id"]: row for row in rows}
+    finally:
+        conn.close()
