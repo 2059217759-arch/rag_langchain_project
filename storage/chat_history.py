@@ -47,8 +47,8 @@ class MySQLChatMessageHistory(BaseChatMessageHistory):
                     "ORDER BY id DESC LIMIT %s", #限制窗口大小
                     (self.session_id, config.WINDOW_SIZE),
                 )
-                rows = cur.fetchall() # 获取所有行
-            rows.reverse() # 因为我们是倒序取的，所以要反转回来，保证消息顺序是从旧到新
+                rows = list(cur.fetchall())
+            rows.reverse()  # DESC → ASC，LangChain 期望时间正序
             return messages_from_dict([json.loads(row["message"]) for row in rows])
         finally:
             conn.close()

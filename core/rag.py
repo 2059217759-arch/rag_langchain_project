@@ -35,42 +35,6 @@ class RagService:
         self.chat_model = ChatTongyi(model=config.CHAT_MODEL_NAME)
         self.summarizer_model = ChatTongyi(model="qwen-max")
 
-        retriever = self.vector_service.get_retriever()
-
-        def format_docs(docs: list[Document]) -> str:
-            if not docs:
-                return "无相关参考资料"
-
-            # 按 parent_id 去重，保留首次出现（相似度最高）
-            seen = set()
-            parent_ids = []
-            for doc in docs:
-                pid = doc.metadata.get("parent_id")
-                if pid and pid not in seen:
-                    seen.add(pid)
-                    parent_ids.append(pid)
-
-            # 取 top-k 个父块
-            parent_ids = parent_ids[:config.TOP_K_PARENTS]
-
-            # 从 MySQL 获取父块内容
-            parent_map = get_parents_by_ids(parent_ids)
-
-            # 按检索顺序拼接
-            formatted = []
-            for pid in parent_ids:
-                p = parent_map.get(pid)
-                if not p:
-                    continue
-                title = p.get("parent_title", "")
-                content = p.get("parent_content", "")
-                if title:
-                    formatted.append(f"{title}\n{content}")
-                else:
-                    formatted.append(content)
-
-            return "\n\n---\n\n".join(formatted) if formatted else "无相关参考资料"
-
         def _fetch_summary(input_dict: dict, config: RunnableConfig) -> str:
             session_id = config["configurable"]["session_id"]
             summary = MySQLChatMessageHistory.get_summary(session_id)
@@ -82,7 +46,7 @@ class RagService:
             RunnableParallel(
                 {
                     "question": itemgetter("question"),
-                    "context": itemgetter("question") | retriever | format_docs,
+                    "context": RunnableLambda(self._retrieve_and_format),
                     "history": itemgetter("history"),
                     "summary": RunnableLambda(_fetch_summary),
                 }
@@ -101,6 +65,59 @@ class RagService:
             input_messages_key="question",
             history_messages_key="history",
         )
+
+    def _retrieve_and_format(self, input_dict: dict) -> str:
+        """检索 + 重排序 + 拼接 context。"""
+        question = input_dict["question"]
+        docs = self.vector_service.hybrid_search(question)
+        if not docs:
+            return "无相关参考资料"
+
+        # 按 parent_id 去重，保留首次出现（RRF 分数最高）
+        seen = set()
+        parent_ids = []
+        for doc in docs:
+            pid = doc.metadata.get("parent_id")
+            if pid and pid not in seen:
+                seen.add(pid)
+                parent_ids.append(pid)
+
+        parent_map = get_parents_by_ids(parent_ids)
+
+        # Rerank：构造文档列表，用 CrossEncoder 重新打分
+        if len(parent_ids) > 1:
+            docs_for_rerank = []
+            valid_pids = []
+            for pid in parent_ids:
+                p = parent_map.get(pid)
+                if not p:
+                    continue
+                # 用 title + content 前 2000 字符作为输入，控制 token 量
+                text = f"{p.get('parent_title', '')}\n{p.get('parent_content', '')[:2000]}"
+                docs_for_rerank.append(text)
+                valid_pids.append(pid)
+
+            if docs_for_rerank:
+                scores = self.vector_service.rerank(question, docs_for_rerank)
+                ranked = sorted(zip(valid_pids, scores), key=lambda x: x[1], reverse=True)
+                parent_ids = [pid for pid, _ in ranked[:config.TOP_K_PARENTS]]
+        else:
+            parent_ids = parent_ids[:config.TOP_K_PARENTS]
+
+        # 按 rerank 顺序拼接
+        formatted = []
+        for pid in parent_ids:
+            p = parent_map.get(pid)
+            if not p:
+                continue
+            title = p.get("parent_title", "")
+            content = p.get("parent_content", "")
+            if title:
+                formatted.append(f"{title}\n{content}")
+            else:
+                formatted.append(content)
+
+        return "\n\n---\n\n".join(formatted) if formatted else "无相关参考资料"
 
     def invoke(self, question: str, session_id: str) -> str:
         """执行一次问答，自动管理滑动窗口和摘要。"""

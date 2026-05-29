@@ -1,4 +1,4 @@
-# RAG 智能助手
+# RAG 智能助手 <sup>v2.2.0</sup>
 
 基于 LangChain + Streamlit 的 RAG 问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
 
@@ -6,7 +6,7 @@
 
 - **用户注册/登录** — JWT 认证 + bcrypt 密码哈希
 - **文件上传入库** — 文本/Markdown 文件自动分段 → 向量化 → ChromaDB，支持 MD5 去重，父子块分层存储
-- **智能问答** — 基于上传文档的 RAG 检索增强生成
+- **智能问答** — BM25 + 向量混合检索 + CrossEncoder 重排序，精准召回
 - **滑动窗口上下文** — 只保留最近 K 条完整消息，避免上下文爆炸
 - **对话摘要** — 超出窗口的历史消息自动压缩为摘要，增量更新，恒定成本
 
@@ -19,6 +19,8 @@
 | Embedding | DashScope text-embedding-v4 |
 | 向量库 | ChromaDB（持久化） |
 | 数据库 | MySQL 5.7+ |
+| 检索 | BM25（jieba）+ ChromaDB 向量 → RRF 融合 |
+| 重排序 | BCE-Reranker-Base-V1（本地部署） |
 | 认证 | JWT (HS256) + bcrypt |
 | RAG 框架 | LangChain（RunnableWithMessageHistory） |
 
@@ -42,6 +44,8 @@ rag_project/
 │   └── chat_history.py       # MySQL 对话历史持久化 + 摘要存取
 ├── data/
 │   ├── chroma_db/            # ChromaDB 持久化文件
+│   ├── bm25_index.pkl        # BM25 索引磁盘缓存
+│   ├── models/               # 本地模型（BCE-Reranker-Base-V1）
 │   ├── uploads/              # 用户上传的原始文件
 │   ├── chat_history/         # （预留）本地对话历史
 │   └── md5.text              # 文件去重 MD5 记录
@@ -144,7 +148,7 @@ streamlit run app/login_page.py
 ### 最终 Prompt 结构
 
 ```
-[system] 你是...参考资料：{RAG检索结果}。
+[system] 你是...参考资料：{BM25 + 向量混合检索 → RRF 融合 → CrossEncoder 重排序 → top-4 父块拼接}。
 早前对话摘要：{<=300字摘要，无摘要时为空}
 
 [history — 最近 10 条完整消息]
@@ -168,7 +172,7 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 
 - **父块切分**：优先按 Markdown 标题（`#` ~ `######`）识别章节边界；无标题时按段落空行切分；超长段落按句子边界强制截断。父块目标大小 ≤ 4000 字符，存入 MySQL `document_parents` 表。
 - **子块切分**：在每个父块内部按句子边界切分为 300 字符的小块，存入 ChromaDB 用于向量检索。
-- **检索流程**：query → ChromaDB 检索 top-8 子块 → 按父块去重 → 取 top-4 父块 → MySQL 查完整父块内容 → 拼入 LLM prompt。
+- **检索流程（v2.2.0）**：query → 向量路（top-8）+ BM25 路（top-8）→ RRF 融合 → 按父块去重 → CrossEncoder 重排序 → 取 top-4 父块 → MySQL 查完整父块内容 → 拼入 LLM prompt。
 
 ## 配置参考
 
@@ -179,7 +183,11 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 | `PARENT_MAX_SIZE` | `4000` | 父块目标大小上限（字符） |
 | `CHILD_CHUNK_SIZE` | `300` | 子块大小（用于向量检索） |
 | `CHILD_CHUNK_OVERLAP` | `50` | 子块重叠量 |
-| `TOP_K_CHILDREN` | `8` | 检索子块数 |
-| `TOP_K_PARENTS` | `4` | 返回父块数 |
+| `TOP_K_CHILDREN` | `8` | 向量检索子块数 |
+| `TOP_K_BM25` | `8` | BM25 检索子块数 |
+| `TOP_K_PARENTS` | `4` | 最终返回父块给 LLM 的数量 |
+| `RRF_K` | `60` | RRF 融合常数 |
+| `RERANKER_MODEL` | `data/models/bce-reranker-base_v1` | 本地重排序模型路径 |
+| `BM25_INDEX_PATH` | `data/bm25_index.pkl` | BM25 磁盘缓存路径 |
 | `COLLECTION_NAME` | `rag` | ChromaDB 集合名 |
 | `JWT_EXPIRE_HOURS` | `24` | Token 过期时间 |

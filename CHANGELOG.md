@@ -1,5 +1,26 @@
 # Changelog
 
+## [v2.2.0] — 2026-05-29
+
+### 新增
+
+- **BM25 + RRF 混合检索**：在向量检索之外增加 BM25 稀疏检索（jieba 分词），双路结果通过 RRF（k=60）融合排序，互补语义匹配和关键词匹配的优势
+- **本地 CrossEncoder 重排序**：部署 BCE-Reranker-Base-V1（278M 参数）对候选父块二次精排，懒加载模式避免阻塞 Streamlit 启动
+- **BM25 磁盘缓存**：BM25 索引通过 pickle 持久化到 `data/bm25_index.pkl`，文档数量未变时直接复用，避免重复构建
+
+### 变更
+
+- **`core/vector_store.py`**：新增 `_build_bm25()` / `hybrid_search()` / `rerank()` 方法，`VectorStoreService` 从纯向量检索升级为混合检索引擎
+- **`core/rag.py`**：`_retrieve_and_format()` 集成 reranker，候选父块按 CrossEncoder 分数重新排序后取 top-k
+- **`core/config.py`**：新增 `TOP_K_BM25` / `RRF_K` / `RERANKER_MODEL` / `BM25_INDEX_PATH`
+- **`requirements.txt`**：新增 `rank-bm25` / `jieba` / `sentence-transformers` / `torch`
+
+### 修复
+
+- **聊天历史顺序错误**：`MySQLChatMessageHistory.messages` 的 `ORDER BY id DESC` 后漏掉 `.reverse()`，导致历史消息逆序传给 LLM，模型混淆对话时序，反复出现"您的上个问题是…"等串话现象
+
+---
+
 ## [v2.1.0] — 2026-05-27
 
 ### 新增
