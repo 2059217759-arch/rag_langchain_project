@@ -1,5 +1,27 @@
 # Changelog
 
+## [v2.3.0] — 2026-05-31
+
+### 新增
+
+- **Agent 范式（ReAct）**：从纯链式结构升级为 Agent，`create_react_agent` + `AgentExecutor` 替代 `RunnableWithMessageHistory`，LLM 自主决策是否检索、检索什么、检索几次，显式 Thought → Action → Observation 推理链
+- **DeepSeek V4 Pro 模型**：对话模型从通义千问 qwen-max 切换为 DeepSeek V4 Pro（OpenAI 兼容 API），`ChatOpenAI` 替代 `ChatTongyi`
+- **检索 Tool 化**：`_retrieve_and_format` 重构为 `_search_knowledge_base`，通过 `StructuredTool` 包装，由 Agent 按需调用
+- **Agent 诊断日志**：`data/agent.log` 记录每次调用的耗时和工具调用次数
+
+### 变更
+
+- **`core/rag.py`**：整体重构，移除 `RunnableParallel` / `RunnableWithMessageHistory` / `ChatTongyi`，引入 `PromptTemplate`（ReAct 格式）+ `create_react_agent` + `AgentExecutor` + `ChatOpenAI`，历史管理改为手动 load/save
+- **`core/config.py`**：新增 `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` / `DEEPSEEK_CHAT_MODEL`
+- **`.env`**：新增 DeepSeek 相关环境变量
+- **`requirements.txt`**：新增 `langchain-openai`
+
+### 修复
+
+- 简单问候不再浪费检索调用（Agent 跳过 Action 直接 Final Answer）
+
+---
+
 ## [v2.2.0] — 2026-05-29
 
 ### 新增

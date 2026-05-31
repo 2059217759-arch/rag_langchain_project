@@ -1,4 +1,4 @@
-# RAG 智能助手 <sup>v2.2.0</sup>
+# RAG 智能助手 <sup>v2.3.0</sup>
 
 基于 LangChain + Streamlit 的 RAG 问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
 
@@ -6,7 +6,7 @@
 
 - **用户注册/登录** — JWT 认证 + bcrypt 密码哈希
 - **文件上传入库** — 文本/Markdown 文件自动分段 → 向量化 → ChromaDB，支持 MD5 去重，父子块分层存储
-- **智能问答** — BM25 + 向量混合检索 + CrossEncoder 重排序，精准召回
+- **Agent 智能问答** — ReAct 范式，LLM 自主决定是否检索、检索什么、检索几次，BM25 + 向量混合检索 + CrossEncoder 重排序
 - **滑动窗口上下文** — 只保留最近 K 条完整消息，避免上下文爆炸
 - **对话摘要** — 超出窗口的历史消息自动压缩为摘要，增量更新，恒定成本
 
@@ -15,14 +15,14 @@
 | 组件 | 技术 |
 |------|------|
 | 框架 | Streamlit |
-| LLM | 通义千问 qwen-max（对话 + 摘要） |
+| LLM | DeepSeek V4 Pro（对话 + 摘要，OpenAI 兼容 API） |
 | Embedding | DashScope text-embedding-v4 |
 | 向量库 | ChromaDB（持久化） |
 | 数据库 | MySQL 5.7+ |
 | 检索 | BM25（jieba）+ ChromaDB 向量 → RRF 融合 |
 | 重排序 | BCE-Reranker-Base-V1（本地部署） |
 | 认证 | JWT (HS256) + bcrypt |
-| RAG 框架 | LangChain（RunnableWithMessageHistory） |
+| Agent 框架 | LangChain ReAct（`create_react_agent` + `AgentExecutor`） |
 
 ## 项目结构
 
@@ -103,7 +103,11 @@ pip install -r requirements.txt
 ### 3. 配置 .env
 
 ```bash
-DASHSCOPE_API_KEY=sk-your-key-here
+DASHSCOPE_API_KEY=sk-your-key-here      # Embedding 模型：DashScope text-embedding-v4
+
+DEEPSEEK_API_KEY=sk-your-key-here       # 对话模型：DeepSeek V4 Pro
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_CHAT_MODEL=deepseek-v4-pro
 
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
@@ -145,19 +149,21 @@ streamlit run app/login_page.py
 3. **恒定成本**：摘要长度上限 300 字，不论对话多长，每次摘要调用成本 O(1)
 4. **失败容忍**：摘要异常被静默捕获，不影响主对话流程
 
-### 最终 Prompt 结构
+### Agent 推理流程（v2.3.0）
+
+系统采用 ReAct 范式，检索不再是固定步骤，而是 LLM 可自主调用的 Tool：
 
 ```
-[system] 你是...参考资料：{BM25 + 向量混合检索 → RRF 融合 → CrossEncoder 重排序 → top-4 父块拼接}。
-早前对话摘要：{<=300字摘要，无摘要时为空}
-
-[history — 最近 10 条完整消息]
-Human: "xxx"
-AI: "xxx"
-...
-
-[human] 当前问题
+Question: 用户问题
+Thought: 分析是否需要检索 → 不需要则直接 Final Answer
+Action: search_knowledge_base
+Action Input: 搜索关键词
+Observation: [BM25 + 向量混合检索 → RRF 融合 → CrossEncoder 重排序 → top-4 父块]
+Thought: 我已获得足够信息，可以回答
+Final Answer: 基于资料的回复
 ```
+
+对于简单问候，Agent 跳过 Action 直接回复，避免不必要的检索开销。
 
 ### 相关配置
 
@@ -178,7 +184,8 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `CHAT_MODEL_NAME` | `qwen-max` | 对话模型 |
+| `DEEPSEEK_CHAT_MODEL` | `deepseek-chat` | 对话模型 |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 地址 |
 | `WINDOW_SIZE` | `10` | 滑动窗口消息条数 |
 | `PARENT_MAX_SIZE` | `4000` | 父块目标大小上限（字符） |
 | `CHILD_CHUNK_SIZE` | `300` | 子块大小（用于向量检索） |

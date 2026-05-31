@@ -24,7 +24,12 @@ TOP_K_PARENTS = 4            # 最终返回多少个父块给 LLM
 RRF_K = 60                   # RRF 融合常数
 RERANKER_MODEL = os.path.join(DATA_DIR, "models", "bce-reranker-base_v1")
 
-# ── Chat Model ─────────────────────────────────────
+# ── DeepSeek Chat Model ────────────────────────────
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_CHAT_MODEL = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-v4-pro")
+
+# ── Chat Model (legacy) ────────────────────────────
 CHAT_MODEL_NAME = "qwen-max"
 
 # ── Chat Window ────────────────────────────────────

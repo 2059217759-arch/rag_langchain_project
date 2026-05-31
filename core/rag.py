@@ -1,12 +1,9 @@
 from langchain_community.embeddings import DashScopeEmbeddings
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_community.chat_models.tongyi import ChatTongyi
-from langchain_core.documents import Document
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnableLambda, RunnableParallel
-from langchain_core.runnables.config import RunnableConfig
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from operator import itemgetter
+from langchain_core.prompts import PromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.tools import StructuredTool
+from langchain_classic.agents import create_react_agent, AgentExecutor
 
 from core import config
 from core.database import get_connection, get_parents_by_ids
@@ -14,66 +11,86 @@ from core.vector_store import VectorStoreService
 from storage.chat_history import MySQLChatMessageHistory
 
 
+def _format_chat_history(messages: list) -> str:
+    if not messages:
+        return "（无）"
+    lines = []
+    for msg in messages:
+        role = "用户" if msg.type == "human" else "助手"
+        lines.append(f"{role}: {msg.content}")
+    return "\n".join(lines)
+
+
 class RagService:
     def __init__(self):
         self.vector_service = VectorStoreService(
             embedding=DashScopeEmbeddings(model="text-embedding-v4")
         )
-
-        self.prompt_template = ChatPromptTemplate.from_messages(
-            [
-                (
-                    "system",
-                    "你是一个智能对话助手，以我提供的已知资料为主，"
-                    "简洁和专业的回答用户的问题。参考资料：{context}。"
-                    "{summary}",
-                ),
-                MessagesPlaceholder(variable_name="history"),
-                ("human", "{question}"),
-            ]
+        # 模型用于 Agent 的对话和决策，支持工具调用和复杂交互
+        self.chat_model = ChatOpenAI(
+            model=config.DEEPSEEK_CHAT_MODEL,
+            api_key=config.DEEPSEEK_API_KEY,
+            base_url=config.DEEPSEEK_BASE_URL,
         )
-        self.chat_model = ChatTongyi(model=config.CHAT_MODEL_NAME)
-        self.summarizer_model = ChatTongyi(model="qwen-max")
-
-        def _fetch_summary(input_dict: dict, config: RunnableConfig) -> str:
-            session_id = config["configurable"]["session_id"]
-            summary = MySQLChatMessageHistory.get_summary(session_id)
-            if summary:
-                return f"\n\n早前对话摘要：\n{summary}"
-            return ""
-
-        base_chain = (
-            RunnableParallel(
-                {
-                    "question": itemgetter("question"),
-                    "context": RunnableLambda(self._retrieve_and_format),
-                    "history": itemgetter("history"),
-                    "summary": RunnableLambda(_fetch_summary),
-                }
-            )
-            | self.prompt_template
-            | self.chat_model
-            | StrOutputParser()
+        # 总结超出滑动窗口的摘要
+        self.summarizer_model = ChatOpenAI(
+            model=config.DEEPSEEK_CHAT_MODEL,
+            api_key=config.DEEPSEEK_API_KEY,
+            base_url=config.DEEPSEEK_BASE_URL,
+        )
+        
+        self._search_tool = StructuredTool.from_function(
+            func=self._search_knowledge_base,
+            name="search_knowledge_base",
+            description=(
+                "搜索内部知识库，获取与查询相关的文档资料。"
+                "输入应为简洁的搜索查询语句，系统将返回最相关的文档内容。"
+                "当需要查找具体信息、数据或参考资料时使用此工具。"
+            ),
         )
 
-        def get_history(session_id: str):
-            return MySQLChatMessageHistory(session_id=session_id)
-
-        self.chain = RunnableWithMessageHistory(
-            base_chain,
-            get_session_history=get_history,
-            input_messages_key="question",
-            history_messages_key="history",
+        self._agent_prompt = PromptTemplate.from_template(
+            "你是一个智能对话助手。{summary}\n\n"
+            "你可以使用以下工具：\n"
+            "{tools}\n\n"
+            "请严格遵循以下 ReAct 格式：\n\n"
+            "Question: 用户提出的问题\n"
+            "Thought: 分析问题，判断是否需要使用工具，如果需要，想清楚搜索什么关键词\n"
+            "Action: 工具名称，可选 [{tool_names}]\n"
+            "Action Input: 传给工具的具体参数\n"
+            "Observation: 工具返回的结果\n"
+            "... (Thought/Action/Action Input/Observation 可重复多次，直到获取足够信息)\n"
+            "Thought: 整合所有信息，我现在可以给出最终答案\n"
+            "Final Answer: 最终回复\n\n"
+            "注意：\n"
+            "- 对于简单问候或闲聊，跳过 Action，直接给出 Final Answer\n"
+            "- 检索不到资料时，在 Final Answer 中如实告知\n"
+            "- Final Answer 用中文回答\n\n"
+            "历史对话：\n"
+            "{chat_history}\n\n"
+            "Question: {input}\n"
+            "{agent_scratchpad}"
         )
 
-    def _retrieve_and_format(self, input_dict: dict) -> str:
-        """检索 + 重排序 + 拼接 context。"""
-        question = input_dict["question"]
-        docs = self.vector_service.hybrid_search(question)
+        agent = create_react_agent(
+            self.chat_model, [self._search_tool], self._agent_prompt
+        )
+        # # 核心，负责协调LLM和工具的调用，执行Agent的决策流程 
+        self._executor = AgentExecutor(
+            agent=agent,
+            tools=[self._search_tool],
+            verbose=False,
+            max_iterations=5,
+            handle_parsing_errors=True, # 忽略解析错误
+            return_intermediate_steps=True, # 返回中间步骤
+        )
+
+    def _search_knowledge_base(self, query: str) -> str:
+        """检索 + 重排序 + 拼接 context，返回给 Agent 使用。"""
+        docs = self.vector_service.hybrid_search(query)
         if not docs:
-            return "无相关参考资料"
+            return "未找到相关参考资料"
 
-        # 按 parent_id 去重，保留首次出现（RRF 分数最高）
         seen = set()
         parent_ids = []
         for doc in docs:
@@ -84,7 +101,6 @@ class RagService:
 
         parent_map = get_parents_by_ids(parent_ids)
 
-        # Rerank：构造文档列表，用 CrossEncoder 重新打分
         if len(parent_ids) > 1:
             docs_for_rerank = []
             valid_pids = []
@@ -92,19 +108,17 @@ class RagService:
                 p = parent_map.get(pid)
                 if not p:
                     continue
-                # 用 title + content 前 2000 字符作为输入，控制 token 量
                 text = f"{p.get('parent_title', '')}\n{p.get('parent_content', '')[:2000]}"
                 docs_for_rerank.append(text)
                 valid_pids.append(pid)
 
             if docs_for_rerank:
-                scores = self.vector_service.rerank(question, docs_for_rerank)
+                scores = self.vector_service.rerank(query, docs_for_rerank)
                 ranked = sorted(zip(valid_pids, scores), key=lambda x: x[1], reverse=True)
                 parent_ids = [pid for pid, _ in ranked[:config.TOP_K_PARENTS]]
         else:
             parent_ids = parent_ids[:config.TOP_K_PARENTS]
 
-        # 按 rerank 顺序拼接
         formatted = []
         for pid in parent_ids:
             p = parent_map.get(pid)
@@ -117,27 +131,54 @@ class RagService:
             else:
                 formatted.append(content)
 
-        return "\n\n---\n\n".join(formatted) if formatted else "无相关参考资料"
+        return "\n\n---\n\n".join(formatted) if formatted else "未找到相关参考资料"
 
     def invoke(self, question: str, session_id: str) -> str:
-        """执行一次问答，自动管理滑动窗口和摘要。"""
-        res = self.chain.invoke(
-            {"question": question},
-            config={"configurable": {"session_id": session_id}},
+        """执行一次问答。Agent 自主决定是否检索知识库。"""
+        import time
+
+        history = MySQLChatMessageHistory(session_id=session_id)
+        chat_history = _format_chat_history(history.messages)
+
+        summary = MySQLChatMessageHistory.get_summary(session_id)
+        summary_text = f"早前对话摘要：\n{summary}" if summary else ""
+
+        t0 = time.time()
+        result = self._executor.invoke(
+            {
+                "input": question,
+                "chat_history": chat_history,
+                "summary": summary_text,
+            }
         )
+        t1 = time.time()
+
+        steps = result.get("intermediate_steps", [])
+        log_line = f"[Agent] 耗时={t1-t0:.1f}s, tool调用={len(steps)}次, question={question[:50]}"
+        for i, (action, _) in enumerate(steps):
+            log_line += f" | step{i+1}: tool={action.tool}, input={str(action.tool_input)[:80]}"
+        with open("/home/zhuohao/rag_project/data/agent.log", "a") as f:
+            f.write(log_line + "\n")
+
+        output = result["output"]
+
+        history.add_messages(
+            [HumanMessage(content=question), AIMessage(content=output)]
+        )
+
         self._maybe_update_summary(session_id)
-        return res
-    # 增量摘要
+        return output
+
     def _maybe_update_summary(self, session_id: str) -> None:
         try:
             total = MySQLChatMessageHistory.count_messages(session_id)
             if total <= config.WINDOW_SIZE:
                 return
 
-            # 找到刚滑出窗口的最后一条消息 ID
             overflow_count = total - config.WINDOW_SIZE
-            conn = get_connection()
+            conn = None
             try:
+                conn = get_connection()
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT id FROM chat_history WHERE session_id = %s "
@@ -149,11 +190,12 @@ class RagService:
                     return
                 last_overflow_id = row["id"]
             finally:
-                conn.close()
+                if conn:
+                    conn.close()
 
-            # 查当前已摘要到的位置
-            conn = get_connection()
+            conn = None
             try:
+                conn = get_connection()
                 with conn.cursor() as cur:
                     cur.execute(
                         "SELECT last_summarized_msg_id FROM chat_summary WHERE session_id = %s",
@@ -162,21 +204,20 @@ class RagService:
                     row = cur.fetchone()
                 last_summarized = row["last_summarized_msg_id"] if row else 0
             finally:
-                conn.close()
+                if conn:
+                    conn.close()
 
-            # 取新溢出消息，在两个端之间
             new_msgs = MySQLChatMessageHistory.get_messages_in_range(
                 session_id, last_summarized, last_overflow_id
             )
             if not new_msgs:
                 return
 
-            # 格式化为文本
             lines = []
             for msg in new_msgs:
                 role = "用户" if msg.type == "human" else "助手"
                 lines.append(f"{role}：{msg.content}")
-            new_text = "\n".join(lines)  # 这里的new_text长度是个增量
+            new_text = "\n".join(lines)
 
             existing_summary = MySQLChatMessageHistory.get_summary(session_id)
 
@@ -196,4 +237,4 @@ class RagService:
             new_summary = self.summarizer_model.invoke(summary_prompt).content
             MySQLChatMessageHistory.save_summary(session_id, new_summary, last_overflow_id)
         except Exception:
-            pass  # 摘要失败不影响主流程
+            pass

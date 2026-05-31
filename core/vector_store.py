@@ -102,6 +102,7 @@ class VectorStoreService:
         bm25_k = config.TOP_K_BM25
 
         # ── 向量路 ──
+        # 得到父块列表
         vector_docs = self.vector_store.similarity_search(query, k=vec_k)
 
         # ── BM25 路 ──
@@ -140,7 +141,8 @@ class VectorStoreService:
             rrf_scores[key] = rrf_scores.get(key, 0) + 1.0 / (config.RRF_K + rank)
             if key not in doc_map:
                 doc_map[key] = doc
-
+        # 排序，根据RRF分数从高到低排序，返回最终的文档列表，每个元素都是一个Document对象
+        # 里面存储了子块内容、元数据等信息
         sorted_keys = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
         return [doc_map[key] for key in sorted_keys]
 
