@@ -51,21 +51,21 @@ class RagService:
 
         self._agent_prompt = PromptTemplate.from_template(
             "你是一个智能对话助手。{summary}\n\n"
-            "你可以使用以下工具：\n"
+            "你可以使用以下工具（可选: {tool_names}）：\n"
             "{tools}\n\n"
-            "请严格遵循以下 ReAct 格式：\n\n"
-            "Question: 用户提出的问题\n"
-            "Thought: 分析问题，判断是否需要使用工具，如果需要，想清楚搜索什么关键词\n"
-            "Action: 工具名称，可选 [{tool_names}]\n"
-            "Action Input: 传给工具的具体参数\n"
-            "Observation: 工具返回的结果\n"
-            "... (Thought/Action/Action Input/Observation 可重复多次，直到获取足够信息)\n"
-            "Thought: 整合所有信息，我现在可以给出最终答案\n"
-            "Final Answer: 最终回复\n\n"
-            "注意：\n"
-            "- 对于简单问候或闲聊，跳过 Action，直接给出 Final Answer\n"
-            "- 检索不到资料时，在 Final Answer 中如实告知\n"
-            "- Final Answer 用中文回答\n\n"
+            "当需要检索知识库时，按以下格式输出（每行一个标记，不要混在同一行）：\n\n"
+            "Thought: 你需要查找什么信息\n"
+            "Action: search_knowledge_base\n"
+            "Action Input: 搜索关键词\n\n"
+            "然后你会收到 Observation（工具返回的结果）。"
+            "根据结果，你可以再次 Thought/Action 继续搜索，或者直接给出最终答案。\n\n"
+            "不需要检索时（闲聊、问候、或已有足够信息），直接输出：\n\n"
+            "Thought: 不需要检索\n"
+            "Final Answer: 你的回答\n\n"
+            "规则：\n"
+            "- Thought / Action / Action Input / Final Answer 每行必须以对应关键词开头\n"
+            "- 不要在 Thought 行内混入 Action 或 Final Answer\n"
+            "- 用中文回答\n\n"
             "历史对话：\n"
             "{chat_history}\n\n"
             "Question: {input}\n"
@@ -80,9 +80,10 @@ class RagService:
             agent=agent,
             tools=[self._search_tool],
             verbose=False,
-            max_iterations=5,
-            handle_parsing_errors=True, # 忽略解析错误
-            return_intermediate_steps=True, # 返回中间步骤
+            max_iterations=8,
+            max_execution_time=120,
+            handle_parsing_errors=True,
+            return_intermediate_steps=True,
         )
 
     def _search_knowledge_base(self, query: str) -> str:
@@ -161,6 +162,18 @@ class RagService:
             f.write(log_line + "\n")
 
         output = result["output"]
+        if "iteration limit" in output or "time limit" in output:
+            # Agent 超出迭代/时间限制时，尝试从已检索的内容中给出部分回答
+            useful_steps = [
+                (a, o) for a, o in steps
+                if a.tool == "search_knowledge_base"
+                and "未找到" not in str(o)
+            ]
+            if useful_steps:
+                last_obs = str(useful_steps[-1][1])[:500]
+                output = f"抱歉，处理超时。以下是我检索到的部分信息：\n\n{last_obs}"
+            else:
+                output = "抱歉，处理请求时超时了，请换个方式提问或稍后重试。"
 
         history.add_messages(
             [HumanMessage(content=question), AIMessage(content=output)]

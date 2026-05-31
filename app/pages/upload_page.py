@@ -14,14 +14,11 @@ st.set_page_config(page_title="文档上传", page_icon="📄", layout="wide")
 _CSS = """
 <style>
 .main .block-container { padding-top: 1.5rem; }
-.card {
-    background: #fff;
-    border-radius: 14px;
-    padding: 1.5rem;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.04);
-    border: 1px solid #E5E7EB;
-    margin-bottom: 1rem;
+/* 侧边栏按钮全宽 */
+section[data-testid="stSidebar"] .stButton > button {
+    width: 100%;
 }
+/* 标题栏 */
 .title-bar {
     display: flex;
     align-items: center;
@@ -30,11 +27,7 @@ _CSS = """
     border-bottom: 1px solid #E5E7EB;
     margin-bottom: 1rem;
 }
-.title-bar h2 { margin: 0; font-size: 1.4rem; color: #1A73E8; }
-section[data-testid="stSidebar"] {
-    background: #F8FAFC;
-    border-right: 1px solid #E5E7EB;
-}
+.title-bar h2 { margin: 0; font-size: 1.4rem; }
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)

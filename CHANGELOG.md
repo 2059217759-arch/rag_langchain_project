@@ -1,5 +1,27 @@
 # Changelog
 
+## [v2.4.0] — 2026-05-31
+
+### 新增
+
+- **历史会话记录**：侧边栏新增"最近 10 轮对话"，`MySQLChatMessageHistory.get_recent_rounds()` 从 MySQL 查询历史问答对，expander 折叠展示，跨会话持久化
+- **记忆框架架构文档**：README 新增记忆框架架构说明，阐述为什么用 `BaseChatMessageHistory` + `RunnableWithMessageHistory`（LCEL）而非旧版 `Conversation*Memory` 类
+
+### 变更
+
+- **`core/rag.py` — Agent 稳定性**
+  - ReAct prompt 精简，明确"每行一个标记，不要混在同一行"，减少格式解析失败
+  - `max_iterations` 5 → 8，新增 `max_execution_time=120` 秒硬超时
+  - `invoke()` 新增降级处理：超出迭代/时间限制时，尝试返回已检索的部分信息而非裸露错误
+- **`storage/chat_history.py`**：新增 `get_recent_rounds()` 静态方法，返回最近 N 轮 user+assistant 配对消息
+
+### 修复
+
+- **前端可读性**：移除 chat_page / upload_page / login_page 的自定义颜色和背景覆盖，修复暗色调文字被遮挡问题，统一使用 Streamlit 浅色主题
+- **Agent `tool_names` 缺失**：修复 prompt 精简后遗漏 `{tool_names}` 占位符导致 `ValueError: Prompt missing required variables`
+
+---
+
 ## [v2.3.0] — 2026-05-31
 
 ### 新增

@@ -13,46 +13,16 @@ _CSS = """
 <style>
 .main .block-container { padding-top: 3rem; }
 .login-card {
-    background: #fff;
-    border-radius: 16px;
-    padding: 2.5rem 2rem 2rem;
-    box-shadow: 0 4px 24px rgba(0,0,0,0.06);
     max-width: 420px;
     margin: 0 auto;
-}
-.login-card .stTabs [data-baseweb="tab-list"] {
-    gap: 0;
-    border-bottom: 2px solid #E5E7EB;
-}
-.login-card .stTabs [data-baseweb="tab"] {
-    flex: 1;
-    justify-content: center;
-    font-size: 1rem;
-    font-weight: 600;
-    padding: 0.6rem 0;
-    border-radius: 0;
-    color: #6B7280;
-}
-.login-card .stTabs [data-baseweb="tab"][aria-selected="true"] {
-    color: #1A73E8;
-    border-bottom: 2px solid #1A73E8;
-    margin-bottom: -2px;
+    padding: 2.5rem 2rem 2rem;
 }
 .login-card .stButton > button {
     width: 100%;
-    border-radius: 10px;
-    padding: 0.55rem 0;
-    font-size: 1rem;
-    font-weight: 600;
-    background: #1A73E8;
-    color: #fff;
-    border: none;
-    transition: background 0.2s;
 }
-.login-card .stButton > button:hover { background: #1557B0; }
 .brand { text-align: center; margin-bottom: 1.5rem; }
-.brand h1 { font-size: 2rem; color: #1A73E8; margin: 0; }
-.brand p { color: #6B7280; font-size: 0.95rem; margin-top: 0.25rem; }
+.brand h1 { font-size: 2rem; margin: 0; }
+.brand p { font-size: 0.95rem; margin-top: 0.25rem; }
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)

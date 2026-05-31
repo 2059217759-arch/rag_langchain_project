@@ -116,6 +116,31 @@ class MySQLChatMessageHistory(BaseChatMessageHistory):
             conn.close()
 
     @staticmethod
+    def get_recent_rounds(session_id: str, rounds: int = 10) -> list[dict]:
+        """获取最近 N 轮对话，每轮包含 user 问题和 assistant 回复。"""
+        conn = get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT message FROM chat_history WHERE session_id = %s "
+                    "ORDER BY id DESC LIMIT %s",
+                    (session_id, rounds * 2),
+                )
+                rows = list(cur.fetchall())
+            rows.reverse()
+            msgs = messages_from_dict([json.loads(row["message"]) for row in rows])
+            result = []
+            for i in range(0, len(msgs) - 1, 2):
+                if msgs[i].type == "human" and msgs[i + 1].type == "ai":
+                    result.append({
+                        "question": msgs[i].content,
+                        "answer": msgs[i + 1].content,
+                    })
+            return result
+        finally:
+            conn.close()
+
+    @staticmethod
     def get_messages_in_range(session_id: str, after_id: int, to_id: int) -> list[BaseMessage]:
         conn = get_connection()
         try:

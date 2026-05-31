@@ -1,4 +1,4 @@
-# RAG 智能助手 <sup>v2.3.0</sup>
+# RAG 智能助手 <sup>v2.4.0</sup>
 
 基于 LangChain + Streamlit 的 RAG 问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
 
@@ -9,6 +9,7 @@
 - **Agent 智能问答** — ReAct 范式，LLM 自主决定是否检索、检索什么、检索几次，BM25 + 向量混合检索 + CrossEncoder 重排序
 - **滑动窗口上下文** — 只保留最近 K 条完整消息，避免上下文爆炸
 - **对话摘要** — 超出窗口的历史消息自动压缩为摘要，增量更新，恒定成本
+- **历史会话记录** — 侧边栏查看最近 10 轮对话，从 MySQL 持久化读取，跨会话保留
 
 ## 技术栈
 
@@ -134,7 +135,41 @@ streamlit run app/login_page.py
 
 ## 上下文管理机制
 
-为了避免对话变长导致 prompt 超出 LLM 上下文窗口，系统使用 **滑动窗口 + 对话摘要** 双层机制：
+为了避免对话变长导致 prompt 超出 LLM 上下文窗口，系统使用 **滑动窗口 + 对话摘要** 双层机制。
+
+### 记忆框架架构
+
+LangChain 提供了两类记忆/对话历史方案：
+
+| 方案 | 所属模块 | 适用场景 |
+|------|---------|---------|
+| `ConversationBufferMemory` / `ConversationBufferWindowMemory` / `ConversationSummaryBufferMemory` | `langchain.memory`（旧版 API） | `LLMChain` / `ConversationChain` 体系 |
+| `BaseChatMessageHistory` + `RunnableWithMessageHistory` | `langchain_core`（LCEL 新架构） | `create_react_agent` + `AgentExecutor` 体系 |
+
+本项目采用 **LCEL 新架构**，不直接使用旧版 `Conversation*Memory` 类，而是通过继承 `BaseChatMessageHistory` 自行实现了等价的三种记忆模式：
+
+```
+RunnableWithMessageHistory   ← 框架层：链执行前后自动调用 memory.add_messages / memory.messages
+        ↑
+BaseChatMessageHistory       ← 抽象接口：add_messages / messages / clear
+        ↑
+MySQLChatMessageHistory      ← 自定义实现：MySQL 持久化 + 滑动窗口 + 摘要存取
+```
+
+三种记忆模式的对应关系：
+
+| LangChain 旧版类 | 本项目等价实现 | 机制 |
+|-----------------|--------------|------|
+| `ConversationBufferMemory` | `MySQLChatMessageHistory.messages`（不加 LIMIT 即为全量） | 存储完整对话历史 |
+| `ConversationBufferWindowMemory`（K 轮） | `WINDOW_SIZE = 10`，SQL `LIMIT 10`（约 5 轮） | 只保留最近 K 条消息 |
+| `ConversationSummaryBufferMemory` | `_maybe_update_summary()` + `chat_summary` 表 | 超长历史用 LLM 增量摘要压缩 |
+
+采用 LCEL 架构的优势：
+
+- **持久化自由** — 旧版 Memory 默认存内存，重启即丢；本项目直接写入 MySQL，跨会话持久化
+- **摘要与对话解耦** — `{summary}` 和 `{chat_history}` 是独立占位符，提示词模板更清晰
+- **增量摘要** — `last_summarized_msg_id` 标记实现增量更新，每次只摘要新溢出消息，旧版无此能力
+- **Agent 原生兼容** — 旧版 Memory 对接 `create_react_agent` + `AgentExecutor` 需要额外适配层
 
 ### 滑动窗口
 

@@ -13,29 +13,9 @@ st.set_page_config(page_title="智能助手", page_icon="💬", layout="wide")
 _CSS = """
 <style>
 .main .block-container { padding-top: 1.5rem; }
-/* 侧边栏 */
-section[data-testid="stSidebar"] {
-    background: #F8FAFC;
-    border-right: 1px solid #E5E7EB;
-}
+/* 侧边栏按钮全宽 */
 section[data-testid="stSidebar"] .stButton > button {
     width: 100%;
-    border-radius: 8px;
-    font-weight: 500;
-}
-/* 聊天气泡 */
-[data-testid="stChatMessage"] {
-    border-radius: 14px;
-    padding: 0.75rem 1rem;
-    margin-bottom: 0.5rem;
-}
-[data-testid="stChatMessage"] [data-testid="stChatMessageAvatar"], [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
-    display: flex;
-    align-items: flex-start;
-}
-/* 用户消息 */
-[data-testid="stChatMessage"][data-testid="stChatMessage"]:has(.stChatMessage[data-testid="stChatMessage-icon-user"]) {
-    background: none;
 }
 /* 标题栏 */
 .title-bar {
@@ -46,7 +26,7 @@ section[data-testid="stSidebar"] .stButton > button {
     border-bottom: 1px solid #E5E7EB;
     margin-bottom: 0.5rem;
 }
-.title-bar h2 { margin: 0; font-size: 1.4rem; color: #1A73E8; }
+.title-bar h2 { margin: 0; font-size: 1.4rem; }
 </style>
 """
 st.markdown(_CSS, unsafe_allow_html=True)
@@ -76,6 +56,28 @@ with st.sidebar:
         st.session_state["access_token"] = None
         st.session_state["username"] = None
         st.switch_page("login_page.py")
+
+    st.divider()
+
+    # ── 历史会话记录 ──
+    st.markdown("##### 📜 最近 10 轮对话")
+    try:
+        from storage.chat_history import MySQLChatMessageHistory
+        rounds = MySQLChatMessageHistory.get_recent_rounds(
+            st.session_state["username"], rounds=10
+        )
+        if rounds:
+            for i, r in enumerate(rounds):
+                label = r["question"][:28] + ("..." if len(r["question"]) > 28 else "")
+                with st.expander(f"{i+1}. {label}"):
+                    st.caption("**问**")
+                    st.text(r["question"])
+                    st.caption("**答**")
+                    st.text(r["answer"])
+        else:
+            st.caption("暂无对话记录")
+    except Exception:
+        st.caption("加载失败")
 
     st.divider()
 
