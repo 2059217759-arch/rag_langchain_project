@@ -1,5 +1,25 @@
 # Changelog
 
+## [v2.5.0] — 2026-06-01
+
+### 变更
+
+- **原生 Function Calling 替代文本模拟 ReAct**：移除 `langchain_classic` 的 `create_react_agent` + `AgentExecutor`，改用 `ChatOpenAI.bind_tools()` + 自写 Agent 循环，LLM 通过结构化 JSON (`tool_calls`) 决策工具调用，消除正则解析脆弱性
+- **`core/rag.py` 重构**：
+  - 移除 `PromptTemplate`（ReAct 格式指令）、`StructuredTool`、`_format_chat_history()`
+  - 新增 OpenAI 兼容 tool schema 定义（`_tool_schemas`），直接传 `bind_tools()`
+  - 历史消息改用原生 `HumanMessage`/`AIMessage` 对象列表，不再拼接为文本
+  - `invoke()` 自写 while 循环替代 `AgentExecutor`：检查 `response.tool_calls` → 执行工具 → 追加 `ToolMessage` → 下一轮
+  - 新增 `data/agent_debug.log` 调试日志，记录每轮 LLM 响应的 `finish_reason`、`tool_calls` 结构
+- **`core/config.py`**：新增 `MAX_ITERATIONS = 8` / `MAX_EXECUTION_TIME = 120`（原 `AgentExecutor` 构造参数硬编码值提取为常量）
+- **依赖清理**：`langchain_classic` 包不再需要
+
+### 修复
+
+- 工具调用决策由模型训练内化，不再依赖 prompt 格式指令，告别 `OutputParserException` 重试
+
+---
+
 ## [v2.4.0] — 2026-05-31
 
 ### 新增

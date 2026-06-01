@@ -1,4 +1,4 @@
-# RAG 智能助手 <sup>v2.4.0</sup>
+# RAG 智能助手 <sup>v2.5.0</sup>
 
 基于 LangChain + Streamlit 的 RAG 问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
 
@@ -23,7 +23,7 @@
 | 检索 | BM25（jieba）+ ChromaDB 向量 → RRF 融合 |
 | 重排序 | BCE-Reranker-Base-V1（本地部署） |
 | 认证 | JWT (HS256) + bcrypt |
-| Agent 框架 | LangChain ReAct（`create_react_agent` + `AgentExecutor`） |
+| Agent 框架 | 原生 Function Calling（`ChatOpenAI.bind_tools()` + 自写 Agent 循环） |
 
 ## 项目结构
 
@@ -184,21 +184,33 @@ MySQLChatMessageHistory      ← 自定义实现：MySQL 持久化 + 滑动窗�
 3. **恒定成本**：摘要长度上限 300 字，不论对话多长，每次摘要调用成本 O(1)
 4. **失败容忍**：摘要异常被静默捕获，不影响主对话流程
 
-### Agent 推理流程（v2.3.0）
+### Agent 推理流程（v2.5.0）
 
-系统采用 ReAct 范式，检索不再是固定步骤，而是 LLM 可自主调用的 Tool：
+系统采用原生 Function Calling 替代文本模拟 ReAct，LLM 通过结构化 JSON 决定是否调用工具：
 
 ```
-Question: 用户问题
-Thought: 分析是否需要检索 → 不需要则直接 Final Answer
-Action: search_knowledge_base
-Action Input: 搜索关键词
-Observation: [BM25 + 向量混合检索 → RRF 融合 → CrossEncoder 重排序 → top-4 父块]
-Thought: 我已获得足够信息，可以回答
-Final Answer: 基于资料的回复
+用户问题
+    │
+    v
+SystemMessage + 历史消息 + HumanMessage(当前问题)
+    │
+    v
+ChatOpenAI.bind_tools([search_knowledge_base])
+    │
+    v
+LLM 返回 AIMessage ──┬── tool_calls 为空 → response.content 即为最终回答
+                     │
+                     └── tool_calls 非空 → 执行 search_knowledge_base
+                           │                        │
+                           │   [BM25 + 向量混合检索 → RRF 融合 → CrossEncoder 重排序 → top-4 父块]
+                           │                        │
+                           └── ToolMessage ──────────┘
+                                     │
+                                     v
+                              下一轮 LLM 调用 → 生成最终回答
 ```
 
-对于简单问候，Agent 跳过 Action 直接回复，避免不必要的检索开销。
+对于简单问候，LLM 自动跳过工具调用直接回复，避免不必要的检索开销。
 
 ### 相关配置
 
@@ -219,8 +231,10 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| `DEEPSEEK_CHAT_MODEL` | `deepseek-chat` | 对话模型 |
+| `DEEPSEEK_CHAT_MODEL` | `deepseek-v4-pro` | 对话模型 |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 地址 |
+| `MAX_ITERATIONS` | `8` | Agent 最大工具调用轮数 |
+| `MAX_EXECUTION_TIME` | `120` | Agent 最大执行时间（秒） |
 | `WINDOW_SIZE` | `10` | 滑动窗口消息条数 |
 | `PARENT_MAX_SIZE` | `4000` | 父块目标大小上限（字符） |
 | `CHILD_CHUNK_SIZE` | `300` | 子块大小（用于向量检索） |

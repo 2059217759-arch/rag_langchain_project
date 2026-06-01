@@ -32,6 +32,10 @@ DEEPSEEK_CHAT_MODEL = os.getenv("DEEPSEEK_CHAT_MODEL", "deepseek-v4-pro")
 # ── Chat Model (legacy) ────────────────────────────
 CHAT_MODEL_NAME = "qwen-max"
 
+# ── Agent ──────────────────────────────────────────
+MAX_ITERATIONS = 8        # Agent 最大工具调用轮数
+MAX_EXECUTION_TIME = 120  # Agent 最大执行时间（秒）
+
 # ── Chat Window ────────────────────────────────────
 WINDOW_SIZE = 10  # 滑动窗口保留最近消息条数（≈5轮问答）
 

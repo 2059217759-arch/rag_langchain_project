@@ -1,24 +1,24 @@
+import json
+import logging
+import time
+
 from langchain_community.embeddings import DashScopeEmbeddings
-from langchain_core.prompts import PromptTemplate
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_core.tools import StructuredTool
-from langchain_classic.agents import create_react_agent, AgentExecutor
 
 from core import config
 from core.database import get_connection, get_parents_by_ids
 from core.vector_store import VectorStoreService
 from storage.chat_history import MySQLChatMessageHistory
 
+logger = logging.getLogger(__name__) # 创建日志记录器
 
-def _format_chat_history(messages: list) -> str:
-    if not messages:
-        return "（无）"
-    lines = []
-    for msg in messages:
-        role = "用户" if msg.type == "human" else "助手"
-        lines.append(f"{role}: {msg.content}")
-    return "\n".join(lines)
+SYSTEM_PROMPT = (
+    "你是一个智能对话助手。{summary}\n\n"
+    "当需要查找具体信息、数据或参考资料时，使用 search_knowledge_base 工具搜索内部知识库。\n"
+    "不需要检索时（闲聊、问候等），直接回答用户问题。\n"
+    "用中文回答。"
+)
 
 
 class RagService:
@@ -26,65 +26,44 @@ class RagService:
         self.vector_service = VectorStoreService(
             embedding=DashScopeEmbeddings(model="text-embedding-v4")
         )
-        # 模型用于 Agent 的对话和决策，支持工具调用和复杂交互
         self.chat_model = ChatOpenAI(
             model=config.DEEPSEEK_CHAT_MODEL,
             api_key=config.DEEPSEEK_API_KEY,
             base_url=config.DEEPSEEK_BASE_URL,
         )
-        # 总结超出滑动窗口的摘要
         self.summarizer_model = ChatOpenAI(
             model=config.DEEPSEEK_CHAT_MODEL,
             api_key=config.DEEPSEEK_API_KEY,
             base_url=config.DEEPSEEK_BASE_URL,
         )
-        
-        self._search_tool = StructuredTool.from_function(
-            func=self._search_knowledge_base,
-            name="search_knowledge_base",
-            description=(
-                "搜索内部知识库，获取与查询相关的文档资料。"
-                "输入应为简洁的搜索查询语句，系统将返回最相关的文档内容。"
-                "当需要查找具体信息、数据或参考资料时使用此工具。"
-            ),
-        )
 
-        self._agent_prompt = PromptTemplate.from_template(
-            "你是一个智能对话助手。{summary}\n\n"
-            "你可以使用以下工具（可选: {tool_names}）：\n"
-            "{tools}\n\n"
-            "当需要检索知识库时，按以下格式输出（每行一个标记，不要混在同一行）：\n\n"
-            "Thought: 你需要查找什么信息\n"
-            "Action: search_knowledge_base\n"
-            "Action Input: 搜索关键词\n\n"
-            "然后你会收到 Observation（工具返回的结果）。"
-            "根据结果，你可以再次 Thought/Action 继续搜索，或者直接给出最终答案。\n\n"
-            "不需要检索时（闲聊、问候、或已有足够信息），直接输出：\n\n"
-            "Thought: 不需要检索\n"
-            "Final Answer: 你的回答\n\n"
-            "规则：\n"
-            "- Thought / Action / Action Input / Final Answer 每行必须以对应关键词开头\n"
-            "- 不要在 Thought 行内混入 Action 或 Final Answer\n"
-            "- 用中文回答\n\n"
-            "历史对话：\n"
-            "{chat_history}\n\n"
-            "Question: {input}\n"
-            "{agent_scratchpad}"
-        )
-
-        agent = create_react_agent(
-            self.chat_model, [self._search_tool], self._agent_prompt
-        )
-        # # 核心，负责协调LLM和工具的调用，执行Agent的决策流程 
-        self._executor = AgentExecutor(
-            agent=agent,
-            tools=[self._search_tool],
-            verbose=False,
-            max_iterations=8,
-            max_execution_time=120,
-            handle_parsing_errors=True,
-            return_intermediate_steps=True,
-        )
+        # 定义了json格式的工具调用规范，供 Agent 使用。未来可扩展更多工具。
+        # Agent 会根据对话上下文自主决定是否调用工具。每次调用后，Agent 会等待工具结果返回，
+        # 再继续下一轮对话或工具调用。
+        self._tool_schemas = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_knowledge_base",
+                    "description": (
+                        "搜索内部知识库，获取与查询相关的文档资料。"
+                        "输入应为简洁的搜索查询语句，系统将返回最相关的文档内容。"
+                        "当需要查找具体信息、数据或参考资料时使用此工具。"
+                    ),
+                    # 调用工具时使用的参数
+                    "parameters": {
+                        "type": "object", # 参数类型为object
+                        "properties": { # 定义参数属性
+                            "query": { # 查询参数
+                                "type": "string",
+                                "description": "搜索查询语句",
+                            }
+                        },
+                        "required": ["query"], # 必须提供查询参数
+                    },
+                },
+            }
+        ]
 
     def _search_knowledge_base(self, query: str) -> str:
         """检索 + 重排序 + 拼接 context，返回给 Agent 使用。"""
@@ -136,51 +115,113 @@ class RagService:
 
     def invoke(self, question: str, session_id: str) -> str:
         """执行一次问答。Agent 自主决定是否检索知识库。"""
-        import time
+        t0 = time.time() # 记录开始时间
 
         history = MySQLChatMessageHistory(session_id=session_id)
-        chat_history = _format_chat_history(history.messages)
+        chat_messages = history.messages 
 
         summary = MySQLChatMessageHistory.get_summary(session_id)
         summary_text = f"早前对话摘要：\n{summary}" if summary else ""
 
-        t0 = time.time()
-        result = self._executor.invoke(
-            {
-                "input": question,
-                "chat_history": chat_history,
-                "summary": summary_text,
-            }
-        )
+        # llm遵循严格的时间序列
+        # SystemMessage是系统指令，
+        messages = [
+            SystemMessage(content=SYSTEM_PROMPT.format(summary=summary_text)),
+        ]
+        messages.extend(chat_messages)
+        messages.append(HumanMessage(content=question))
+
+        # .bind_tools(...): 这是 LangChain 的一个方法。它不会立即调用模型，
+        # 而是返回一个新的、配置好的模型对象（llm_with_tools）。就是加入了工具调用能力的模型。
+        # 真正调用模型是在后面 response = llm_with_tools.invoke(messages) 这一行。
+        llm_with_tools = self.chat_model.bind_tools(self._tool_schemas)
+
+        tool_call_count = 0
+        tool_logs = []
+        final_output = None
+        debug_lines = []
+
+        for i in range(config.MAX_ITERATIONS):  # 最大迭代次数
+            if time.time() - t0 > config.MAX_EXECUTION_TIME:  # 超时
+                debug_lines.append(f"iter{i}: TIMEOUT at {time.time()-t0:.1f}s")
+                break
+
+            # invoke(messages):这是 LangChain 的标准调用方法。它将 Python 的
+            # messages 列表序列化为 JSON，通过 API 发送给 DeepSeek 服务器。
+            response = llm_with_tools.invoke(messages)
+            messages.append(response)
+
+            content_preview = (response.content or "")[:100]
+            raw_tc = response.tool_calls
+            finish = response.response_metadata.get("finish_reason", "?")
+
+            debug_lines.append(
+                f"iter{i}: finish={finish}, content={repr(content_preview)}, "
+                f"tool_calls={raw_tc}, additional_kwargs_keys={list(response.additional_kwargs.keys())}"
+            )
+
+            # 核心逻辑，根据模型返回的 response 判断是否有工具调用。执行不同的分支。
+            if raw_tc:
+                for tc in raw_tc:
+                    tool_name = tc.get("name", "")
+                    tool_args = tc.get("args", {})
+
+                    # tool_args 可能是字符串（JSON格式），也可能已经是解析后的字典。需要兼容处理。
+                    if isinstance(tool_args, str):
+                        tool_args = json.loads(tool_args)
+
+                    tc_id = tc.get("id", "")
+
+                    if tool_name == "search_knowledge_base":
+                        query = tool_args.get("query", "")
+                        result = self._search_knowledge_base(query)  # 调用检索函数
+                        tool_logs.append(f"tool={tool_name}, input={query[:80]}")
+                    else:
+                        result = f"未知工具: {tool_name}"
+                        tool_logs.append(f"tool={tool_name}(unknown)")
+
+                    tool_call_count += 1
+                    debug_lines.append(f"iter{i}: executed {tool_name}, result_len={len(result)}")
+                    # 将工具结果result作为 ToolMessage 添加到消息列表中，供下一轮模型调用使用。
+                    messages.append(ToolMessage(content=result, tool_call_id=tc_id))
+            else:
+                final_output = response.content or ""
+                break
+
         t1 = time.time()
 
-        steps = result.get("intermediate_steps", [])
-        log_line = f"[Agent] 耗时={t1-t0:.1f}s, tool调用={len(steps)}次, question={question[:50]}"
-        for i, (action, _) in enumerate(steps):
-            log_line += f" | step{i+1}: tool={action.tool}, input={str(action.tool_input)[:80]}"
+        if final_output is None:
+            for msg in reversed(messages):
+                if isinstance(msg, ToolMessage) and "未找到" not in msg.content:
+                    final_output = (
+                        f"抱歉，处理超时。以下是我检索到的部分信息：\n\n{msg.content[:500]}"
+                    )
+                    break
+            if final_output is None:
+                final_output = "抱歉，处理请求时超时了，请换个方式提问或稍后重试。"
+
+        log_line = (
+            f"[Agent] 耗时={t1 - t0:.1f}s, tool调用={tool_call_count}次, "
+            f"question={question[:50]}"
+        )
+        for i, tl in enumerate(tool_logs):
+            log_line += f" | step{i + 1}: {tl}"
         with open("/home/zhuohao/rag_project/data/agent.log", "a") as f:
             f.write(log_line + "\n")
 
-        output = result["output"]
-        if "iteration limit" in output or "time limit" in output:
-            # Agent 超出迭代/时间限制时，尝试从已检索的内容中给出部分回答
-            useful_steps = [
-                (a, o) for a, o in steps
-                if a.tool == "search_knowledge_base"
-                and "未找到" not in str(o)
-            ]
-            if useful_steps:
-                last_obs = str(useful_steps[-1][1])[:500]
-                output = f"抱歉，处理超时。以下是我检索到的部分信息：\n\n{last_obs}"
-            else:
-                output = "抱歉，处理请求时超时了，请换个方式提问或稍后重试。"
+        # 调试日志：记录每次 invoke 的 LLM 响应详情，排查工具调用问题
+        with open("/home/zhuohao/rag_project/data/agent_debug.log", "a") as f:
+            f.write(f"--- invoke session={session_id}, question={question[:80]} ---\n")
+            for dl in debug_lines:
+                f.write(f"  {dl}\n")
+            f.write(f"  final: tool_call_count={tool_call_count}\n\n")
 
         history.add_messages(
-            [HumanMessage(content=question), AIMessage(content=output)]
+            [HumanMessage(content=question), AIMessage(content=final_output)]
         )
 
         self._maybe_update_summary(session_id)
-        return output
+        return final_output
 
     def _maybe_update_summary(self, session_id: str) -> None:
         try:
