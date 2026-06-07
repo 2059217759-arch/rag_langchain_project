@@ -81,6 +81,9 @@ with st.sidebar:
 
     st.divider()
 
+    if st.button("📊 性能监控", use_container_width=True):
+        st.switch_page("pages/metrics_page.py")
+
     if st.button("🔄 清空对话", use_container_width=True):
         st.session_state["messages"] = [
             {"role": "assistant", "content": "对话已清空，有什么可以帮你的？"}
