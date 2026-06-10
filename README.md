@@ -1,6 +1,6 @@
-# RAG 智能助手 <sup>v2.5.0</sup>
+# RAG 智能助手 <sup>v2.7.0</sup>
 
-基于 LangChain + Streamlit 的 RAG 问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
+基于 FastAPI + LangChain + Streamlit 的 RAG 高并发问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
 
 ## 功能
 
@@ -10,16 +10,21 @@
 - **滑动窗口上下文** — 只保留最近 K 条完整消息，避免上下文爆炸
 - **对话摘要** — 超出窗口的历史消息自动压缩为摘要，增量更新，恒定成本
 - **历史会话记录** — 侧边栏查看最近 10 轮对话，从 MySQL 持久化读取，跨会话保留
+- **性能监控仪表盘** — 延迟分布、Token 趋势、工具调用统计、缓存命中率，结构化 metrics 持久化到 MySQL
+- **高并发架构** — FastAPI async 路由 + 线程池执行同步逻辑 + ChromaDB Server + MySQL 连接池
+- **SSE 流式返回** — Agent 问答通过 Server-Sent Events 实时推送，用户无需等待完整响应
+- **多会话管理** — 同一用户可创建多个独立会话（`username_uuid`），多端互不干扰
 
 ## 技术栈
 
 | 组件 | 技术 |
 |------|------|
-| 框架 | Streamlit |
+| 后端 | FastAPI (async) + uvicorn |
+| 前端 | Streamlit（纯 UI 层，通过 httpx 调 API） |
 | LLM | DeepSeek V4 Pro（对话 + 摘要，OpenAI 兼容 API） |
 | Embedding | DashScope text-embedding-v4 |
-| 向量库 | ChromaDB（持久化） |
-| 数据库 | MySQL 5.7+ |
+| 向量库 | ChromaDB（Client/Server 模式，独立进程） |
+| 数据库 | MySQL 5.7+（DBUtils 连接池） |
 | 检索 | BM25（jieba）+ ChromaDB 向量 → RRF 融合 |
 | 重排序 | BCE-Reranker-Base-V1（本地部署） |
 | 认证 | JWT (HS256) + bcrypt |
@@ -29,29 +34,103 @@
 
 ```
 rag_project/
+├── api/                        # FastAPI 后端（v2.7.0 新增）
+│   ├── main.py                 # FastAPI app + lifespan + CORS
+│   ├── deps.py                 # 依赖注入（JWT 鉴权、RagService 注入）
+│   ├── schemas.py              # Pydantic 请求/响应模型
+│   └── routes/
+│       ├── auth.py             # POST /api/auth/login, /api/auth/register
+│       ├── chat.py             # POST /api/chat/send (SSE), GET history, DELETE clear
+│       ├── upload.py           # POST /api/upload
+│       └── metrics.py          # GET /api/metrics/summary, /api/metrics/recent
 ├── app/
-│   ├── login_page.py         # 入口：登录 / 注册
+│   ├── login_page.py           # 入口：登录 / 注册（调 FastAPI）
 │   └── pages/
-│       ├── chat_page.py      # 智能助手问答页
-│       └── upload_page.py    # 文本文件上传页
+│       ├── chat_page.py        # 智能助手问答页（httpx SSE 流式调用）
+│       ├── upload_page.py      # 文件上传页（httpx 调 FastAPI）
+│       └── metrics_page.py     # 性能监控仪表盘（httpx 调 FastAPI）
 ├── core/
-│   ├── config.py             # 全局配置（环境变量 + 常量）
-│   ├── database.py           # MySQL 连接池 + 自动建库建表
-│   ├── auth.py               # JWT 签发/解码 + bcrypt 密码管理
-│   ├── rag.py                # RAG 服务：检索链 + 摘要管理
-│   ├── ingestion.py          # 父子块切分（Markdown 结构化）→ 向量化入库 + MD5 去重
-│   └── vector_store.py       # ChromaDB 向量存储封装
+│   ├── config.py               # 全局配置（环境变量 + 常量）
+│   ├── database.py             # MySQL 连接池 + 自动建库建表
+│   ├── auth.py                 # JWT 签发/解码 + bcrypt 密码管理
+│   ├── rag.py                  # RagService 单例 + Agent 循环
+│   ├── ingestion.py            # IngestionService 单例 + 父子块切分
+│   ├── metrics.py              # 性能指标存取（MySQL 持久化 + 聚合查询）
+│   └── vector_store.py         # ChromaDB (HttpClient) + BM25 + Reranker
 ├── storage/
-│   └── chat_history.py       # MySQL 对话历史持久化 + 摘要存取
+│   └── chat_history.py         # MySQL 对话历史持久化 + 摘要存取
 ├── data/
-│   ├── chroma_db/            # ChromaDB 持久化文件
-│   ├── bm25_index.pkl        # BM25 索引磁盘缓存
-│   ├── models/               # 本地模型（BCE-Reranker-Base-V1）
-│   ├── uploads/              # 用户上传的原始文件
-│   ├── chat_history/         # （预留）本地对话历史
-│   └── md5.text              # 文件去重 MD5 记录
-└── .env                      # 环境变量（API Key、数据库连接等）
+│   ├── chroma_db/              # ChromaDB 持久化目录（由 chroma server 管理）
+│   ├── bm25_index.pkl          # BM25 索引磁盘缓存
+│   ├── models/                 # 本地模型（BCE-Reranker-Base-V1）
+│   ├── uploads/                # 用户上传的原始文件
+│   └── md5.text                # 文件去重 MD5 记录
+└── .env                        # 环境变量（API Key、数据库连接等）
 ```
+
+## 并发架构（v2.7.0）
+
+```
+                          ┌─────────────┐
+                          │  Alice 提问  │───httpx SSE───┐
+                          └─────────────┘               │
+                          ┌─────────────┐               │
+                          │   Bob 提问   │───httpx SSE───┤
+                          └─────────────┘               │
+                          ┌─────────────┐               │
+                          │ Charlie 上传 │───httpx───────┤
+                          └─────────────┘               │
+                                                        ▼
+                    ┌──────────────────────────────────────────────┐
+                    │              FastAPI (async)                 │
+                    │  uvicorn --workers N                         │
+                    │                                              │
+                    │  ┌────────────────────────────────────┐     │
+                    │  │  Worker 进程                        │     │
+                    │  │                                      │     │
+                    │  │  async route ──asyncio.to_thread──┐  │     │
+                    │  │       │                            │  │     │
+                    │  │       │  ┌─────────────────────┐   │  │     │
+                    │  │       │  │  ThreadPoolExecutor  │   │  │     │
+                    │  │       │  │  ┌─────┐┌─────┐      │   │  │     │
+                    │  │       │  │  │Req A││Req B│ ...  │   │  │     │
+                    │  │       │  │  └──┬──┘└──┬──┘      │   │  │     │
+                    │  │       │  └─────┼──────┼─────────┘   │  │     │
+                    │  │       │        │      │             │  │     │
+                    │  │       │        ▼      ▼             │  │     │
+                    │  │       │  ┌──────────────────┐       │  │     │
+                    │  │       └──│  RagService (单例) │◄─────┘  │     │
+                    │  │          │  ├─ embedding     │          │     │
+                    │  │          │  ├─ reranker      │          │     │
+                    │  │          │  ├─ BM25 索引      │          │     │
+                    │  │          │  └─ LLM 客户端     │          │     │
+                    │  │          └───────┬───────────┘          │     │
+                    │  └──────────────────┼──────────────────────┘     │
+                    └─────────────────────┼────────────────────────────┘
+                                          │
+                    ┌─────────────────────┼────────────────────────────┐
+                    │              外部服务                            │
+                    │                                                  │
+                    │  ┌─────────────┐  ┌──────────┐  ┌────────────┐  │
+                    │  │ ChromaDB    │  │  MySQL   │  │ DeepSeek   │  │
+                    │  │ Server      │  │ 连接池    │  │ API        │  │
+                    │  │ :8001       │  │          │  │            │  │
+                    │  │ 并发读/写   │  │ min=2    │  │ 外部 HTTP   │  │
+                    │  └─────────────┘  │ max=10   │  └────────────┘  │
+                    │                   └──────────┘                  │
+                    └──────────────────────────────────────────────────┘
+```
+
+多用户请求通过 httpx 打到 FastAPI。async 路由不阻塞事件循环，通过 `asyncio.to_thread` 将同步的 RagService 调用丢入线程池执行。每个 worker 进程内 RagService 是全局单例（`threading.Lock` 双重检查），所有请求共享同一套 embedding / reranker / BM25 索引 / LLM 客户端。ChromaDB 作为独立进程运行（`:8001`），HTTP 接口天然支持并发读写。MySQL 通过 `DBUtils.PooledDB` 连接池复用连接。
+
+| 组件 | 旧架构问题 | v2.7.0 方案 |
+|------|-----------|------------|
+| **请求处理** | Streamlit 单进程，阻塞式 | FastAPI async 路由，`asyncio.to_thread` 线程池 |
+| **RagService** | 每用户创建实例，内存爆炸 | 全局单例，每 worker 进程仅一份 |
+| **ChromaDB** | 嵌入式 SQLite，并发写 `database is locked` | Client/Server 模式，独立进程 |
+| **BM25 索引** | 多实例同时写 pickle 文件，竞态损坏 | `threading.Lock` 保护重建路径 |
+| **MySQL** | 每次请求新建连接 | `DBUtils.PooledDB` 连接池 |
+| **会话隔离** | `session_id = username`，同用户串消息 | `username_uuid` 独立会话 |
 
 ## 数据库设计
 
@@ -67,7 +146,7 @@ rag_project/
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | id | BIGINT PK | 消息 ID |
-| session_id | VARCHAR(128) INDEX | 会话 ID（即用户名） |
+| session_id | VARCHAR(128) INDEX | 会话 ID（`username_uuid`） |
 | message | JSON | LangChain 消息格式 |
 | created_at | DATETIME | 消息时间 |
 
@@ -88,6 +167,37 @@ rag_project/
 | source | VARCHAR(255) | 来源文件名 |
 | child_count | INT | 该父块包含的子块数 |
 
+### metrics
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT PK | 指标 ID |
+| session_id | VARCHAR(128) INDEX | 会话 ID |
+| total_latency_ms | INT | 端到端延迟（ms） |
+| retrieval_latency_ms | INT | 检索耗时（ms） |
+| llm_latency_ms | INT | LLM 调用耗时（ms） |
+| tool_call_count | INT | 工具调用次数 |
+| tool_details | JSON | 工具调用详情 |
+| input_tokens | INT | 输入 token 数 |
+| output_tokens | INT | 输出 token 数 |
+| cache_read_tokens | INT | 缓存命中 token 数 |
+| reasoning_tokens | INT | 推理 token 数 |
+
+## API 文档
+
+FastAPI 启动后访问 `http://localhost:8000/docs` 查看 Swagger UI。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/auth/login` | 登录，返回 JWT token |
+| POST | `/api/auth/register` | 注册 |
+| POST | `/api/chat/send` | 问答（SSE 流式返回） |
+| GET | `/api/chat/history?session_id=xx` | 获取会话历史 |
+| DELETE | `/api/chat/clear` | 清空会话 |
+| POST | `/api/chat/sessions` | 创建新会话 |
+| POST | `/api/upload` | 上传文件到知识库 |
+| GET | `/api/metrics/summary?days=7` | 性能指标汇总 |
+| GET | `/api/metrics/recent?limit=50` | 最近查询明细 |
+
 ## 快速开始
 
 ### 1. 环境要求
@@ -104,18 +214,26 @@ pip install -r requirements.txt
 ### 3. 配置 .env
 
 ```bash
-DASHSCOPE_API_KEY=sk-your-key-here      # Embedding 模型：DashScope text-embedding-v4
+# Embedding
+DASHSCOPE_API_KEY=sk-your-key-here
 
-DEEPSEEK_API_KEY=sk-your-key-here       # 对话模型：DeepSeek V4 Pro
+# 对话模型
+DEEPSEEK_API_KEY=sk-your-key-here
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_CHAT_MODEL=deepseek-v4-pro
 
+# MySQL
 MYSQL_HOST=127.0.0.1
 MYSQL_PORT=3306
 MYSQL_USER=rag_user
 MYSQL_PASSWORD=Rag@123456
 MYSQL_DATABASE=rag_db
 
+# ChromaDB Server
+CHROMA_HOST=127.0.0.1
+CHROMA_PORT=8001
+
+# JWT
 JWT_SECRET_KEY=your-secret-key-change-in-production
 JWT_EXPIRE_HOURS=24
 ```
@@ -123,6 +241,13 @@ JWT_EXPIRE_HOURS=24
 ### 4. 启动
 
 ```bash
+# 1. 启动 ChromaDB Server（独立进程）
+chroma run --path data/chroma_db --port 8001 &
+
+# 2. 启动 FastAPI
+uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+# 3. 启动 Streamlit（纯前端 UI）
 streamlit run app/login_page.py
 ```
 
@@ -246,4 +371,8 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 | `RERANKER_MODEL` | `data/models/bce-reranker-base_v1` | 本地重排序模型路径 |
 | `BM25_INDEX_PATH` | `data/bm25_index.pkl` | BM25 磁盘缓存路径 |
 | `COLLECTION_NAME` | `rag` | ChromaDB 集合名 |
+| `CHROMA_HOST` | `127.0.0.1` | ChromaDB Server 地址 |
+| `CHROMA_PORT` | `8001` | ChromaDB Server 端口 |
+| `MYSQL_POOL_MIN` | `2` | 连接池最小连接数 |
+| `MYSQL_POOL_MAX` | `10` | 连接池最大连接数 |
 | `JWT_EXPIRE_HOURS` | `24` | Token 过期时间 |

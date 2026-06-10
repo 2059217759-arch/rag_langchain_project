@@ -1,5 +1,54 @@
 # Changelog
 
+## [v2.7.0] — 2026-06-10
+
+### 新增
+
+- **FastAPI 高并发后端**：`api/` 模块，用 FastAPI 替代 Streamlit 直接调用 core 服务，async 路由 + `asyncio.to_thread` 线程池执行同步 RAG 逻辑，SSE 流式返回问答结果
+- **多用户并发支持**：ChromaDB 从嵌入式 SQLite 切换为 Client/Server 模式（`chromadb.HttpClient`），MySQL 引入 `DBUtils.PooledDB` 连接池，RagService / IngestionService 全局单例化
+- **会话管理**：新增 `POST /api/chat/sessions` 创建独立会话（`username_uuid`），同一用户支持多端多会话，互不干扰
+- **JWT 鉴权中间件**：`api/deps.py`，`HTTPBearer` + `decode_token` 验证所有 `/api/chat/*` 和 `/api/upload` 请求
+
+### 变更
+
+- **`core/vector_store.py`**：ChromaDB 切为 `chromadb.HttpClient`，BM25 重建加 `threading.Lock` 双重检查保护
+- **`core/database.py`**：`get_connection()` 从每次新建连接改为 `PooledDB` 连接池（min=2, max=10），池构造时指定 `database` 参数
+- **`core/rag.py`**：新增 `get_rag_service()` 模块级单例（双重检查锁），所有请求共享同一套 embedding / reranker / LLM 客户端
+- **`core/ingestion.py`**：新增 `get_ingestion_service()` 单例，切 `chromadb.HttpClient`
+- **`core/config.py`**：新增 `CHROMA_HOST` / `CHROMA_PORT` / `API_BASE_URL` / `MYSQL_POOL_MIN` / `MYSQL_POOL_MAX`
+- **`app/pages/*`**：四个 Streamlit 页面改为通过 `httpx` 调用 FastAPI HTTP 接口，Streamlit 退化为纯 UI 层
+- **`requirements.txt`**：新增 `fastapi` / `DBUtils`
+
+### 架构
+
+```
+用户浏览器 → Streamlit (UI) → httpx → FastAPI (async)
+                                          │
+                                   asyncio.to_thread
+                                          │
+                                   RagService (单例/进程)
+                                   ├── ChromaDB Server (独立进程)
+                                   ├── MySQL 连接池
+                                   └── DeepSeek API
+```
+
+---
+
+
+### 新增
+
+- **性能监控体系**：`core/metrics.py` 结构化记录每次查询的延迟、token 消耗、工具调用详情到 MySQL `metrics` 表
+- **Streamlit 性能仪表盘**：`app/pages/metrics_page.py`，KPI 卡片（总查询数、平均/P50/P95/P99 延迟、缓存命中率）+ 延迟分布直方图 + Token 消耗趋势折线图 + 工具调用分布图 + 最近查询明细表
+
+### 变更
+
+- **`core/rag.py`**：检索和 LLM 调用分开计时（`retrieval_ms` / `llm_ms`），从 `response.usage_metadata` 提取 token 用量（含 `cache_read`、`reasoning`），每次 `invoke()` 末尾写入 metrics
+- **`core/database.py`**：新增 `metrics` 表（`total_latency_ms` / `retrieval_latency_ms` / `llm_latency_ms` / `tool_call_count` / `tool_details` / `input_tokens` / `output_tokens` / `cache_read_tokens` / `reasoning_tokens`）
+- **`app/pages/chat_page.py`**：sidebar 新增「📊 性能监控」入口
+- **移除 `agent.log`**：功能已被 `metrics` 表完全覆盖，仅保留 `agent_debug.log` 用于排查工具调用问题
+
+---
+
 ## [v2.5.0] — 2026-06-01
 
 ### 变更

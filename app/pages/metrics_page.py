@@ -4,8 +4,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import streamlit as st
+import httpx
 
-from core.metrics import get_metrics_summary, get_recent_metrics
+from core import config
 
 st.set_page_config(page_title="性能监控", page_icon="📊", layout="wide")
 
@@ -28,6 +29,9 @@ if "access_token" not in st.session_state or not st.session_state["access_token"
     st.switch_page("login_page.py")
     st.stop()
 
+token = st.session_state["access_token"]
+headers = {"Authorization": f"Bearer {token}"}
+
 # ── Sidebar ──
 with st.sidebar:
     st.markdown("### 📊 性能监控")
@@ -36,9 +40,6 @@ with st.sidebar:
     st.divider()
 
     days = st.selectbox("时间范围", [1, 7, 14, 30], index=1, format_func=lambda d: f"最近 {d} 天")
-
-    user_filter = st.radio("用户范围", ["所有用户", "当前用户"], horizontal=True)
-    session = st.session_state["username"] if user_filter == "当前用户" else None
 
     st.divider()
 
@@ -56,7 +57,16 @@ with st.sidebar:
 # ── Main ──
 st.markdown("## 📊 性能监控")
 
-summary = get_metrics_summary(session_id=session, days=days)
+try:
+    with httpx.Client(base_url=config.API_BASE_URL, headers=headers, timeout=10) as client:
+        r = client.get("/api/metrics/summary", params={"days": days})
+    if r.status_code != 200:
+        st.error(f"获取数据失败: {r.status_code}")
+        st.stop()
+    summary = r.json()
+except Exception as e:
+    st.error(f"连接后端失败: {e}")
+    st.stop()
 
 if summary.get("total_queries", 0) == 0:
     st.info("暂无数据，进行几次对话后将自动显示指标。")
@@ -76,7 +86,6 @@ with col4:
 
 st.divider()
 
-# 第二行 KPI
 col1, col2, col3, col4 = st.columns(4)
 with col1:
     st.metric("P50 延迟", f"{summary['p50_latency_ms'] / 1000:.1f}s")
@@ -100,7 +109,6 @@ st.bar_chart(
     use_container_width=True,
 )
 
-# Token 趋势 + 工具调用分布
 col1, col2 = st.columns(2)
 
 with col1:
@@ -126,7 +134,6 @@ with col2:
 
 st.divider()
 
-# 延迟细分
 st.subheader("🔬 延迟细分")
 col1, col2 = st.columns(2)
 with col1:
@@ -138,20 +145,26 @@ st.divider()
 
 # 最近查询明细
 st.subheader("📋 最近查询明细")
-recent = get_recent_metrics(session_id=session, limit=50)
-if recent:
-    rows = []
-    for r in recent:
-        rows.append({
-            "时间": r["created_at"],
-            "用户": r["session_id"],
-            "问题": r["question"][:60] + ("..." if len(r["question"]) > 60 else ""),
-            "总耗时(s)": f"{r['total_latency_ms']/1000:.1f}",
-            "检索(ms)": r["retrieval_latency_ms"],
-            "LLM(ms)": r["llm_latency_ms"],
-            "工具调用": r["tool_call_count"],
-            "Input Token": f"{r['input_tokens']:,}",
-            "Output Token": f"{r['output_tokens']:,}",
-            "缓存 Token": f"{r['cache_read_tokens']:,}",
-        })
-    st.dataframe(rows, use_container_width=True, hide_index=True)
+try:
+    with httpx.Client(base_url=config.API_BASE_URL, headers=headers, timeout=10) as client:
+        r = client.get("/api/metrics/recent", params={"limit": 50})
+    if r.status_code == 200:
+        recent = r.json()
+        if recent:
+            rows = []
+            for rec in recent:
+                rows.append({
+                    "时间": rec["created_at"],
+                    "用户": rec["session_id"],
+                    "问题": rec["question"][:60] + ("..." if len(rec["question"]) > 60 else ""),
+                    "总耗时(s)": f"{rec['total_latency_ms']/1000:.1f}",
+                    "检索(ms)": rec["retrieval_latency_ms"],
+                    "LLM(ms)": rec["llm_latency_ms"],
+                    "工具调用": rec["tool_call_count"],
+                    "Input Token": f"{rec['input_tokens']:,}",
+                    "Output Token": f"{rec['output_tokens']:,}",
+                    "缓存 Token": f"{rec['cache_read_tokens']:,}",
+                })
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+except Exception:
+    st.caption("加载失败")

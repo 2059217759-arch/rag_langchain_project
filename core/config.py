@@ -13,6 +13,8 @@ os.environ["DASHSCOPE_API_KEY"] = DASHSCOPE_API_KEY or ""
 # ── ChromaDB ───────────────────────────────────────
 COLLECTION_NAME = "rag"
 PERSIST_DIRECTORY = os.path.join(DATA_DIR, "chroma_db")
+CHROMA_HOST = os.getenv("CHROMA_HOST", "127.0.0.1")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8001"))
 
 # ── Parent-Child Chunking ─────────────────────────
 PARENT_MAX_SIZE = 4000       # 父块超过此值触发二次切分
@@ -51,7 +53,12 @@ MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "root")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "rag_db")
+MYSQL_POOL_MIN = int(os.getenv("MYSQL_POOL_MIN", "2"))
+MYSQL_POOL_MAX = int(os.getenv("MYSQL_POOL_MAX", "10"))
 
 # ── JWT ────────────────────────────────────────────
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-secret")
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
+
+# ── FastAPI backend ────────────────────────────────
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")

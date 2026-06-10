@@ -1,7 +1,9 @@
 import os
 import pickle
+import threading
 
-import jieba
+import chromadb
+import jieba 
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from rank_bm25 import BM25Okapi
@@ -12,15 +14,17 @@ from core import config
 class VectorStoreService:
     def __init__(self, embedding):
         self.embedding = embedding
+        _client = chromadb.HttpClient(host=config.CHROMA_HOST, port=config.CHROMA_PORT)
         self.vector_store = Chroma(
+            client=_client,
             collection_name=config.COLLECTION_NAME,
-            persist_directory=config.PERSIST_DIRECTORY,
             embedding_function=embedding,
         )
         self._bm25 = None
         self._bm25_texts = None
         self._bm25_metadatas = None
         self._bm25_doc_count = 0
+        self._bm25_lock = threading.Lock()
         self._reranker = None
 
     # ── BM25 index management ──────────────────────────
@@ -96,7 +100,9 @@ class VectorStoreService:
 
     def hybrid_search(self, query: str, top_k: int = None) -> list[Document]:
         if self._bm25_needs_rebuild():
-            self._build_bm25()
+            with self._bm25_lock:
+                if self._bm25_needs_rebuild():
+                    self._build_bm25()
 
         vec_k = config.TOP_K_CHILDREN
         bm25_k = config.TOP_K_BM25

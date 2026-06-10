@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import time
 
 from langchain_community.embeddings import DashScopeEmbeddings
@@ -8,8 +9,12 @@ from langchain_openai import ChatOpenAI
 
 from core import config
 from core.database import get_connection, get_parents_by_ids
+from core.metrics import save_metrics
 from core.vector_store import VectorStoreService
 from storage.chat_history import MySQLChatMessageHistory
+
+# 导入message_to_dict 函数可以看看invoke转换的jsnon格式。
+from langchain_core.messages import message_to_dict 
 
 logger = logging.getLogger(__name__) # 创建日志记录器
 
@@ -110,12 +115,18 @@ class RagService:
                 formatted.append(f"{title}\n{content}")
             else:
                 formatted.append(content)
-
         return "\n\n---\n\n".join(formatted) if formatted else "未找到相关参考资料"
 
     def invoke(self, question: str, session_id: str) -> str:
         """执行一次问答。Agent 自主决定是否检索知识库。"""
         t0 = time.time() # 记录开始时间
+
+        retrieval_ms_total = 0
+        llm_ms_total = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
+        cache_read_tokens = 0
+        reasoning_tokens = 0
 
         history = MySQLChatMessageHistory(session_id=session_id)
         chat_messages = history.messages 
@@ -124,7 +135,7 @@ class RagService:
         summary_text = f"早前对话摘要：\n{summary}" if summary else ""
 
         # llm遵循严格的时间序列
-        # SystemMessage是系统指令，
+        # SystemMessage是系统指令,即对话背景
         messages = [
             SystemMessage(content=SYSTEM_PROMPT.format(summary=summary_text)),
         ]
@@ -137,9 +148,9 @@ class RagService:
         llm_with_tools = self.chat_model.bind_tools(self._tool_schemas)
 
         tool_call_count = 0
-        tool_logs = []
+        tool_logs = [] # 工具调用日志
         final_output = None
-        debug_lines = []
+        debug_lines = [] # 调试日志
 
         for i in range(config.MAX_ITERATIONS):  # 最大迭代次数
             if time.time() - t0 > config.MAX_EXECUTION_TIME:  # 超时
@@ -148,16 +159,42 @@ class RagService:
 
             # invoke(messages):这是 LangChain 的标准调用方法。它将 Python 的
             # messages 列表序列化为 JSON，通过 API 发送给 DeepSeek 服务器。
+            # 返回的 response 是一个包含模型输出的 LangChain 的 BaseMessage 对象。
+            # 实际我们在调试文件中可以看到原始的api返回的json格式，langchain做了封装
+            llm_t0 = time.time()
             response = llm_with_tools.invoke(messages)
+            llm_ms_total += int((time.time() - llm_t0) * 1000)
             messages.append(response)
 
-            content_preview = (response.content or "")[:100]
-            raw_tc = response.tool_calls
-            finish = response.response_metadata.get("finish_reason", "?")
+            # 从 response 中提取 token 用量
+            usage = response.usage_metadata
+            if usage:
+                total_input_tokens += usage.get("input_tokens", 0)
+                total_output_tokens += usage.get("output_tokens", 0)
+                cache_read_tokens += usage.get("input_token_details", {}).get("cache_read", 0)
+                reasoning_tokens += usage.get("output_token_details", {}).get("reasoning", 0)
+
+            content_preview = (response.content or "")[:100] # 模型输出的预览
+            raw_tc = response.tool_calls # 模型输出的 tool_calls
+            finish = response.response_metadata.get("finish_reason", "?") # 模型结束的原因
+
+            # 调试日志：记录每次迭代的模型响应详情（排查工具调用问题）
+            with open("/home/zhuohao/rag_project/data/agent_debug.log", "a") as f:
+                f.write(f"--- iter{i} session={session_id}, question={question[:80]} ---\n")
+                f.write(f"  finish={finish}, content_preview={repr(content_preview)}\n")
+                f.write(f"  tool_calls={raw_tc}\n")
+                f.write(f"  additional_kwargs={json.dumps(response.additional_kwargs, ensure_ascii=False, default=str)}\n")
+                response_json = json.dumps(
+                    message_to_dict(response), ensure_ascii=False, indent=2, default=str
+                )
+                f.write(f"  response_dict:\n")
+                for line in response_json.split("\n"):
+                    f.write(f"    {line}\n")
+                f.write("\n")
 
             debug_lines.append(
                 f"iter{i}: finish={finish}, content={repr(content_preview)}, "
-                f"tool_calls={raw_tc}, additional_kwargs_keys={list(response.additional_kwargs.keys())}"
+                f"tool_calls={raw_tc}, additional_kwargs={json.dumps(response.additional_kwargs, ensure_ascii=False, default=str)}"
             )
 
             # 核心逻辑，根据模型返回的 response 判断是否有工具调用。执行不同的分支。
@@ -174,7 +211,9 @@ class RagService:
 
                     if tool_name == "search_knowledge_base":
                         query = tool_args.get("query", "")
+                        ret_t0 = time.time()
                         result = self._search_knowledge_base(query)  # 调用检索函数
+                        retrieval_ms_total += int((time.time() - ret_t0) * 1000)
                         tool_logs.append(f"tool={tool_name}, input={query[:80]}")
                     else:
                         result = f"未知工具: {tool_name}"
@@ -182,6 +221,7 @@ class RagService:
 
                     tool_call_count += 1
                     debug_lines.append(f"iter{i}: executed {tool_name}, result_len={len(result)}")
+                    
                     # 将工具结果result作为 ToolMessage 添加到消息列表中，供下一轮模型调用使用。
                     messages.append(ToolMessage(content=result, tool_call_id=tc_id))
             else:
@@ -200,21 +240,28 @@ class RagService:
             if final_output is None:
                 final_output = "抱歉，处理请求时超时了，请换个方式提问或稍后重试。"
 
-        log_line = (
-            f"[Agent] 耗时={t1 - t0:.1f}s, tool调用={tool_call_count}次, "
-            f"question={question[:50]}"
-        )
-        for i, tl in enumerate(tool_logs):
-            log_line += f" | step{i + 1}: {tl}"
-        with open("/home/zhuohao/rag_project/data/agent.log", "a") as f:
-            f.write(log_line + "\n")
-
-        # 调试日志：记录每次 invoke 的 LLM 响应详情，排查工具调用问题
+        # 调试日志：写入每次 invoke 的汇总信息
         with open("/home/zhuohao/rag_project/data/agent_debug.log", "a") as f:
-            f.write(f"--- invoke session={session_id}, question={question[:80]} ---\n")
+            f.write(f"--- invoke summary session={session_id} ---\n")
+            f.write(f"  question={question[:80]}\n")
+            f.write(f"  elapsed={t1 - t0:.1f}s, tool_calls={tool_call_count}\n")
             for dl in debug_lines:
                 f.write(f"  {dl}\n")
-            f.write(f"  final: tool_call_count={tool_call_count}\n\n")
+            f.write(f"  final_output={repr(final_output[:200] if final_output else None)}\n\n")
+
+        save_metrics(
+            session_id=session_id,
+            question=question,
+            total_ms=int((t1 - t0) * 1000),
+            retrieval_ms=retrieval_ms_total,
+            llm_ms=llm_ms_total,
+            tool_call_count=tool_call_count,
+            tool_details=tool_logs,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cache_read_tokens=cache_read_tokens,
+            reasoning_tokens=reasoning_tokens,
+        )
 
         history.add_messages(
             [HumanMessage(content=question), AIMessage(content=final_output)]
@@ -292,3 +339,17 @@ class RagService:
             MySQLChatMessageHistory.save_summary(session_id, new_summary, last_overflow_id)
         except Exception:
             pass
+
+
+_rag_instance = None
+_rag_lock = threading.Lock()
+
+
+def get_rag_service() -> RagService:
+    """获取 RagService 全局单例，线程安全。"""
+    global _rag_instance
+    if _rag_instance is None:
+        with _rag_lock:
+            if _rag_instance is None:
+                _rag_instance = RagService()
+    return _rag_instance

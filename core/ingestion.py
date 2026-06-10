@@ -1,8 +1,10 @@
 import os
 import re
 import hashlib
+import threading
 from datetime import datetime
 
+import chromadb
 from langchain_chroma import Chroma
 from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -162,10 +164,11 @@ class ParentChildSplitter:
 class IngestionService:
     def __init__(self):
         os.makedirs(config.PERSIST_DIRECTORY, exist_ok=True)
+        _client = chromadb.HttpClient(host=config.CHROMA_HOST, port=config.CHROMA_PORT)
         self.chroma = Chroma(
+            client=_client,
             collection_name=config.COLLECTION_NAME,
             embedding_function=DashScopeEmbeddings(model="text-embedding-v4"),
-            persist_directory=config.PERSIST_DIRECTORY,
         )
         self.splitter = ParentChildSplitter(
             parent_max=config.PARENT_MAX_SIZE,
@@ -223,3 +226,17 @@ class IngestionService:
 
         _save_md5(md5_hex)
         return f"[成功]已载入向量库（{len(parent_records)} 个父块，{len(all_children)} 个子块）"
+
+
+_ingestion_instance = None
+_ingestion_lock = threading.Lock()
+
+
+def get_ingestion_service() -> IngestionService:
+    """获取 IngestionService 全局单例，线程安全。"""
+    global _ingestion_instance
+    if _ingestion_instance is None:
+        with _ingestion_lock:
+            if _ingestion_instance is None:
+                _ingestion_instance = IngestionService()
+    return _ingestion_instance

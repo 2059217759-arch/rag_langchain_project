@@ -4,8 +4,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
+import httpx # 这是一个 HTTP 客户端库
 
-from core.auth import register_user, login_user
+from core import config
 
 st.set_page_config(page_title="RAG 智能助手", page_icon="🤖", layout="centered")
 
@@ -37,8 +38,8 @@ if "username" not in st.session_state:
 if st.session_state["access_token"]:
     st.markdown('<div class="brand"><h1>🤖 RAG 智能助手</h1></div>', unsafe_allow_html=True)
     st.success(f"已登录：**{st.session_state['username']}**")
-    col_a, col_b = st.columns(2)
-    with col_a:
+    col_a, col_b = st.columns(2) # 创建两个列
+    with col_a: 
         st.page_link("pages/chat_page.py", label="💬 进入对话", use_container_width=True)
     with col_b:
         st.page_link("pages/upload_page.py", label="📄 文档上传", use_container_width=True)
@@ -57,23 +58,43 @@ else:
         login_username = st.text_input("用户名", key="login_user", placeholder="请输入用户名")
         login_password = st.text_input("密码", type="password", key="login_pass", placeholder="请输入密码")
         if st.button("登 录", type="primary", use_container_width=True, key="btn_login"):
-            ok, msg, token = login_user(login_username, login_password)
-            if ok and token:
-                st.session_state["access_token"] = token
-                st.session_state["username"] = login_username
-                st.success(msg)
-                st.rerun()
-            else:
-                st.error(msg)
+            try:
+                # 当程序执行到 with 行时，会调用 httpx.Client 对象的 __enter__ 方法。
+                # 初始化 HTTP 客户端，建立必要的连接池等资源。
+                with httpx.Client(base_url=config.API_BASE_URL, timeout=10) as client:
+                    r = client.post(
+                        "/api/auth/login",
+                        json={"username": login_username, "password": login_password},
+                    )
+                if r.status_code == 200: # r是响应对象
+                    data = r.json()
+                    st.session_state["access_token"] = data["token"]
+                    st.session_state["username"] = login_username
+                    st.success(data["message"])
+                    st.rerun()
+                else:
+                    detail = r.json().get("detail", "登录失败")
+                    st.error(detail)
+            except Exception as e:
+                st.error(f"连接后端失败: {e}")
 
     with tab2:
         reg_username = st.text_input("用户名", key="reg_user", placeholder="至少3个字符")
         reg_password = st.text_input("密码", type="password", key="reg_pass", placeholder="至少6个字符")
         if st.button("注 册", type="primary", use_container_width=True, key="btn_register"):
-            ok, msg = register_user(reg_username, reg_password)
-            if ok:
-                st.success(msg)
-            else:
-                st.error(msg)
+            try:
+                with httpx.Client(base_url=config.API_BASE_URL, timeout=10) as client:
+                    r = client.post(
+                        "/api/auth/register",
+                        json={"username": reg_username, "password": reg_password},
+                    )
+                if r.status_code == 200:
+                    data = r.json()
+                    st.success(data["message"])
+                else:
+                    detail = r.json().get("detail", "注册失败")
+                    st.error(detail)
+            except Exception as e:
+                st.error(f"连接后端失败: {e}")
 
     st.markdown('</div>', unsafe_allow_html=True)

@@ -1,7 +1,7 @@
 import datetime
 
 import jwt
-import bcrypt
+import bcrypt # bcrypt是一个用于密码加密的库
 
 from core import config
 from core.database import get_connection

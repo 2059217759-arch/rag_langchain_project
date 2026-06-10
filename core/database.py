@@ -1,24 +1,45 @@
 import pymysql
-import threading # 多线程
+import threading
+from dbutils.pooled_db import PooledDB
+
 from core import config
 
+_pool = None
 _initialized = False
 _init_lock = threading.Lock()
 
 
+def _get_pool():
+    global _pool
+    if _pool is None:
+        with _init_lock:
+            if _pool is None:
+                _pool = PooledDB(
+                    creator=pymysql,
+                    mincached=config.MYSQL_POOL_MIN,
+                    maxconnections=config.MYSQL_POOL_MAX,
+                    host=config.MYSQL_HOST,
+                    port=config.MYSQL_PORT,
+                    user=config.MYSQL_USER,
+                    password=config.MYSQL_PASSWORD,
+                    database=config.MYSQL_DATABASE,
+                    charset="utf8mb4",
+                    cursorclass=pymysql.cursors.DictCursor,
+                )
+    return _pool
+
+
 def get_connection():
-    """返回 MySQL 连接，首次调用自动建库建表。"""
+    """从连接池获取 MySQL 连接，首次调用自动建库建表。"""
     global _initialized
     if not _initialized:
-        # 使用锁确保多线程下只初始化一次
         with _init_lock:
-            if not _initialized:  # 双重检查锁定
+            if not _initialized:
                 _init_db()
                 _initialized = True
-    return _make_connection(config.MYSQL_DATABASE)
+    return _get_pool().connection()
 
 
-# 连接数据库
 def _make_connection(database: str):
     conn = None
     try:
@@ -51,7 +72,6 @@ def _init_db():
             charset="utf8mb4",
         )
         with conn.cursor() as cur:
-            # 简单校验数据库名，防止注入
             db_name = config.MYSQL_DATABASE
             if not db_name.isidentifier():
                 raise ValueError("Invalid database name")
@@ -113,6 +133,27 @@ def _init_db():
                     operator        VARCHAR(50) DEFAULT 'zhuohao',
                     child_count     INT DEFAULT 0,
                     INDEX idx_source (source)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS metrics (
+                    id                  BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    session_id          VARCHAR(128) NOT NULL,
+                    question            VARCHAR(500) NOT NULL,
+                    total_latency_ms    INT NOT NULL,
+                    retrieval_latency_ms INT DEFAULT 0,
+                    llm_latency_ms      INT DEFAULT 0,
+                    tool_call_count     INT DEFAULT 0,
+                    tool_details        JSON,
+                    input_tokens        INT DEFAULT 0,
+                    output_tokens       INT DEFAULT 0,
+                    cache_read_tokens   INT DEFAULT 0,
+                    reasoning_tokens    INT DEFAULT 0,
+                    created_at          DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_metrics_session (session_id),
+                    INDEX idx_metrics_created (created_at)
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
