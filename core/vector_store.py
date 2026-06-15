@@ -11,12 +11,14 @@ from rank_bm25 import BM25Okapi
 from core import config
 
 
-class VectorStoreService:
+class VectorStoreService: # 向量存储服务
     def __init__(self, embedding):
-        self.embedding = embedding
+        self.embedding = embedding #嵌入模型
+        # 创建ChromaDB客户端
         _client = chromadb.HttpClient(host=config.CHROMA_HOST, port=config.CHROMA_PORT)
         self.vector_store = Chroma(
-            client=_client,
+            # 意思是向量存储服务会调用刚刚定义的客户端接口，同时你需要在终端开启chroma服务器
+            client=_client, 
             collection_name=config.COLLECTION_NAME,
             embedding_function=embedding,
         )
@@ -24,7 +26,7 @@ class VectorStoreService:
         self._bm25_texts = None
         self._bm25_metadatas = None
         self._bm25_doc_count = 0
-        self._bm25_lock = threading.Lock()
+        self._bm25_lock = threading.Lock() # 创建锁对象
         self._reranker = None
 
     # ── BM25 index management ──────────────────────────
@@ -97,6 +99,7 @@ class VectorStoreService:
         self._build_bm25()
 
     # ── Hybrid search ──────────────────────────────────
+    # 相似度检索BM25和向量检索
 
     def hybrid_search(self, query: str, top_k: int = None) -> list[Document]:
         if self._bm25_needs_rebuild():
@@ -166,6 +169,6 @@ class VectorStoreService:
 
     def get_retriever(self):
         return self.vector_store.as_retriever(
-            search_type="similarity",
+            search_type="similarity", # 使用相似度搜索
             search_kwargs={"k": config.TOP_K_CHILDREN}, 
         )

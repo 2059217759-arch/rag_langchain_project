@@ -6,7 +6,7 @@ from core.rag import get_rag_service
 
 security = HTTPBearer()
 
-
+# 依赖注入模块dependency
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> dict:
     """验证 JWT token，返回当前用户信息。"""
     try:

@@ -5,9 +5,10 @@ from core.metrics import get_metrics_summary, get_recent_metrics
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"])
 
-
+# 指标路由模块
 @router.get("/summary")
 def metrics_summary(
+    # quary用来验证查询参数，默认查询最近7天，ge和le限制了范围
     days: int = Query(default=7, ge=1, le=90),
     user: dict = Depends(get_current_user),
 ):

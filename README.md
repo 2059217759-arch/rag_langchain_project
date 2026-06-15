@@ -70,67 +70,76 @@ rag_project/
 
 ## 并发架构（v2.7.0）
 
-```
-                          ┌─────────────┐
-                          │  Alice 提问  │───httpx SSE───┐
-                          └─────────────┘               │
-                          ┌─────────────┐               │
-                          │   Bob 提问   │───httpx SSE───┤
-                          └─────────────┘               │
-                          ┌─────────────┐               │
-                          │ Charlie 上传 │───httpx───────┤
-                          └─────────────┘               │
-                                                        ▼
-                    ┌──────────────────────────────────────────────┐
-                    │              FastAPI (async)                 │
-                    │  uvicorn --workers N                         │
-                    │                                              │
-                    │  ┌────────────────────────────────────┐     │
-                    │  │  Worker 进程                        │     │
-                    │  │                                      │     │
-                    │  │  async route ──asyncio.to_thread──┐  │     │
-                    │  │       │                            │  │     │
-                    │  │       │  ┌─────────────────────┐   │  │     │
-                    │  │       │  │  ThreadPoolExecutor  │   │  │     │
-                    │  │       │  │  ┌─────┐┌─────┐      │   │  │     │
-                    │  │       │  │  │Req A││Req B│ ...  │   │  │     │
-                    │  │       │  │  └──┬──┘└──┬──┘      │   │  │     │
-                    │  │       │  └─────┼──────┼─────────┘   │  │     │
-                    │  │       │        │      │             │  │     │
-                    │  │       │        ▼      ▼             │  │     │
-                    │  │       │  ┌──────────────────┐       │  │     │
-                    │  │       └──│  RagService (单例) │◄─────┘  │     │
-                    │  │          │  ├─ embedding     │          │     │
-                    │  │          │  ├─ reranker      │          │     │
-                    │  │          │  ├─ BM25 索引      │          │     │
-                    │  │          │  └─ LLM 客户端     │          │     │
-                    │  │          └───────┬───────────┘          │     │
-                    │  └──────────────────┼──────────────────────┘     │
-                    └─────────────────────┼────────────────────────────┘
-                                          │
-                    ┌─────────────────────┼────────────────────────────┐
-                    │              外部服务                            │
-                    │                                                  │
-                    │  ┌─────────────┐  ┌──────────┐  ┌────────────┐  │
-                    │  │ ChromaDB    │  │  MySQL   │  │ DeepSeek   │  │
-                    │  │ Server      │  │ 连接池    │  │ API        │  │
-                    │  │ :8001       │  │          │  │            │  │
-                    │  │ 并发读/写   │  │ min=2    │  │ 外部 HTTP   │  │
-                    │  └─────────────┘  │ max=10   │  └────────────┘  │
-                    │                   └──────────┘                  │
-                    └──────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Clients["👤 客户端"]
+        Alice["Alice 提问"]
+        Bob["Bob 提问"]
+        Charlie["Charlie 上传"]
+    end
+
+    Alice -->|"httpx SSE"| API_Layer
+    Bob -->|"httpx SSE"| API_Layer
+    Charlie -->|"httpx"| API_Layer
+
+    subgraph FastAPI["⚡ FastAPI :8000 (uvicorn --workers N)"]
+        API_Layer["Async 路由层<br/>━━━━━━━━━━━━<br/>/api/auth/* · /api/chat/* · /api/upload · /api/metrics/*"]
+
+        subgraph Worker["Worker 进程 (×N)"]
+            direction TB
+            EL["🔄 async 事件循环<br/><i>主线程，永不阻塞</i>"]
+            Pool["ThreadPoolExecutor<br/>8~12 线程并发"]
+            RS["RagService 单例<br/>━━━━━━━━━━<br/>DashScopeEmbeddings<br/>BCE-Reranker-Base-V1<br/>BM25Okapi 索引<br/>ChatOpenAI 客户端"]
+
+            EL -->|"await asyncio.to_thread()<br/>提交任务 → 协程挂起<br/>事件循环继续处理其他请求"| Pool
+            Pool -->|"多线程并发调用<br/>各线程独立栈/局部变量"| RS
+        end
+
+        API_Layer --> EL
+    end
+
+    subgraph External["☁️ 外部服务"]
+        ChromaDB[("ChromaDB Server<br/>:8001<br/>HTTP 并发读写")]
+        MySQL[("MySQL 5.7+<br/>DBUtils 连接池<br/>min=2 · max=10")]
+        DeepSeek["DeepSeek V4 Pro<br/>对话 + 摘要"]
+        DashScope["DashScope API<br/>text-embedding-v4"]
+    end
+
+    RS -->|"HttpClient"| ChromaDB
+    RS -->|"PooledDB"| MySQL
+    RS -->|"OpenAI 兼容 API"| DeepSeek
+    RS -->|"Embedding API"| DashScope
 ```
 
-多用户请求通过 httpx 打到 FastAPI。async 路由不阻塞事件循环，通过 `asyncio.to_thread` 将同步的 RagService 调用丢入线程池执行。每个 worker 进程内 RagService 是全局单例（`threading.Lock` 双重检查），所有请求共享同一套 embedding / reranker / BM25 索引 / LLM 客户端。ChromaDB 作为独立进程运行（`:8001`），HTTP 接口天然支持并发读写。MySQL 通过 `DBUtils.PooledDB` 连接池复用连接。
+  多用户请求通过 httpx 打到 FastAPI。async 路由不阻塞事件循环，通过 `asyncio.to_thread` 将同步的 RagService 调用丢入线程池执行，同时主线程还可执行事件循环，接收其他的http请求。
+
+  每个 worker 进程内 RagService 是全局单例（`threading.Lock` 双重检查），所有请求共享同一套 embedding / reranker / BM25 索引 / LLM 客户端。ChromaDB 作为独立进程运行（`:8001`），HTTP 接口天然支持并发读写。MySQL 通过 `DBUtils.PooledDB` 连接池复用连接。
+
+  **这里提出一个问题，项目的RagService是全局单例，假如我fastapi只开一个worker进程，那如果有多 用户同时聊天调用了ragservice，会阻塞吗？**
+
+答：不会阻塞。注意区别单例和线程池，多个用户同时发请求时，各自的 rag.invoke() 会在线程池的不同线程中并发执行。
+
+  具体原理：
+
+  1. 事件循环（主线程）不会卡住：await asyncio.to_thread(rag.invoke, ...) 只是把rag.invoke 这个同步任务提交ThreadPoolExecutor
+        的队列里，然后当前协程挂起，事件循环立刻回头去处理其他请求（比如用户 B的请求）。
+  2. 线程池允许多线程并发：Python 默认线程池大小为 min(32, cpu_count + 4)，通常8~12 个线程。每个 rag.invoke()
+      跑在独立线程上，各有自己的调用栈和局部变量，互不阻塞。
+    3. 单例 RagService 只是个容器对象，多线程同时调用它没有问题，关键在于它内部各组件是否线程安全：
+
+  简单说：单 worker 进程下，事件循环负责快速调度，线程池负责并发执行同步的 RAG调用。只要并发用户数不超过线程池大小（默认
+  8~12），所有用户都能同时得到服务；超过后排队等待，但事件循环本身始终不会阻塞。
 
 | 组件 | 旧架构问题 | v2.7.0 方案 |
 |------|-----------|------------|
 | **请求处理** | Streamlit 单进程，阻塞式 | FastAPI async 路由，`asyncio.to_thread` 线程池 |
 | **RagService** | 每用户创建实例，内存爆炸 | 全局单例，每 worker 进程仅一份 |
-| **ChromaDB** | 嵌入式 SQLite，并发写 `database is locked` | Client/Server 模式，独立进程 |
+| **ChromaDB** | 嵌入式 SQLite，并发写 `database is locked` | **Client/Server 模式，独立进程，主服务线程池每个线程会发起独立 HTTP 请求** |
 | **BM25 索引** | 多实例同时写 pickle 文件，竞态损坏 | `threading.Lock` 保护重建路径 |
-| **MySQL** | 每次请求新建连接 | `DBUtils.PooledDB` 连接池 |
+| **MySQL** | 每次请求新建连接 | **`DBUtils.PooledDB` 连接池，每次 get_connection() 从池里拿独立连接** |
 | **会话隔离** | `session_id = username`，同用户串消息 | `username_uuid` 独立会话 |
+
+
 
 ## 数据库设计
 
@@ -313,26 +322,39 @@ MySQLChatMessageHistory      ← 自定义实现：MySQL 持久化 + 滑动窗�
 
 系统采用原生 Function Calling 替代文本模拟 ReAct，LLM 通过结构化 JSON 决定是否调用工具：
 
-```
-用户问题
-    │
-    v
-SystemMessage + 历史消息 + HumanMessage(当前问题)
-    │
-    v
-ChatOpenAI.bind_tools([search_knowledge_base])
-    │
-    v
-LLM 返回 AIMessage ──┬── tool_calls 为空 → response.content 即为最终回答
-                     │
-                     └── tool_calls 非空 → 执行 search_knowledge_base
-                           │                        │
-                           │   [BM25 + 向量混合检索 → RRF 融合 → CrossEncoder 重排序 → top-4 父块]
-                           │                        │
-                           └── ToolMessage ──────────┘
-                                     │
-                                     v
-                              下一轮 LLM 调用 → 生成最终回答
+```mermaid
+flowchart TD
+    Start(["💬 用户提问"]) --> BuildMsg["构建消息列表<br/>SystemMessage + 历史消息 + HumanMessage"]
+    BuildMsg --> BindTools["ChatOpenAI.bind_tools<br/>search_knowledge_base"]
+    BindTools --> LLMCall["LLM 调用 (DeepSeek V4 Pro)"]
+
+    LLMCall --> CheckTC{"AIMessage.tool_calls?"}
+
+    CheckTC -- "为空 → 直接回复" --> Final["✉️ 返回 response.content<br/>最终回答"]
+    CheckTC -- "非空" --> ExecTool["🔧 执行 search_knowledge_base"]
+
+    ExecTool --> Search["BM25 + 向量混合检索<br/>→ RRF 融合<br/>→ CrossEncoder 重排序<br/>→ top-4 父块"]
+
+    Search --> ToolMsg["追加 ToolMessage 到消息列表"]
+    ToolMsg --> CheckIter{"iter &lt; MAX_ITERATIONS<br/>且未超时?"}
+    CheckIter -- "是 → 继续" --> LLMCall
+    CheckIter -- "否 → 超时兜底" --> Timeout["返回超时兜底回答"]
+
+    Final --> SaveHistory["💾 保存对话到 MySQL<br/>chat_history 表"]
+    Timeout --> SaveHistory
+
+    SaveHistory --> CheckWindow{"消息数 &gt; WINDOW_SIZE?"}
+    CheckWindow -- "是" --> UpdateSummary["📝 LLM 增量更新摘要<br/>写入 chat_summary 表"]
+    CheckWindow -- "否" --> Done(["✅ 完成"])
+
+    UpdateSummary --> Done
+
+    style Start fill:#4CAF50,color:#fff
+    style Final fill:#2196F3,color:#fff
+    style Done fill:#4CAF50,color:#fff
+    style Search fill:#FF9800,color:#fff
+    style SaveHistory fill:#9C27B0,color:#fff
+    style UpdateSummary fill:#FF5722,color:#fff
 ```
 
 对于简单问候，LLM 自动跳过工具调用直接回复，避免不必要的检索开销。
@@ -351,6 +373,32 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 - **父块切分**：优先按 Markdown 标题（`#` ~ `######`）识别章节边界；无标题时按段落空行切分；超长段落按句子边界强制截断。父块目标大小 ≤ 4000 字符，存入 MySQL `document_parents` 表。
 - **子块切分**：在每个父块内部按句子边界切分为 300 字符的小块，存入 ChromaDB 用于向量检索。
 - **检索流程（v2.2.0）**：query → 向量路（top-8）+ BM25 路（top-8）→ RRF 融合 → 按父块去重 → CrossEncoder 重排序 → 取 top-4 父块 → MySQL 查完整父块内容 → 拼入 LLM prompt。
+
+```mermaid
+flowchart LR
+    Query(["🔍 用户查询 query"]) --> Tokenize["结巴分词<br/>jieba.lcut_for_search"]
+
+    Tokenize --> VecPath["向量路<br/>ChromaDB similarity_search"]
+    Tokenize --> BM25Path["BM25 路<br/>BM25Okapi.get_scores"]
+
+    VecPath --> VecTop["top-8 子块<br/>(cosine 相似度)"]
+    BM25Path --> BM25Filter["过滤 score > 0"]
+    BM25Filter --> BM25Top["top-8 子块<br/>(BM25 得分)"]
+
+    VecTop --> RRF["🔀 RRF 融合<br/>score = Σ 1/(K + rank)<br/>K = 60"]
+    BM25Top --> RRF
+
+    RRF --> Dedup["按 parent_id 去重"]
+    Dedup --> Rerank["🎯 CrossEncoder 重排序<br/>BCE-Reranker-Base-V1"]
+    Rerank --> TopK["取 top-4 父块"]
+    TopK --> MySQL["MySQL 查完整父块内容<br/>document_parents 表"]
+    MySQL --> Context(["📋 拼接为 context<br/>返回给 LLM"])
+
+    style Query fill:#4CAF50,color:#fff
+    style RRF fill:#FF9800,color:#fff
+    style Rerank fill:#E91E63,color:#fff
+    style Context fill:#2196F3,color:#fff
+```
 
 ## 配置参考
 
@@ -376,3 +424,4 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 | `MYSQL_POOL_MIN` | `2` | 连接池最小连接数 |
 | `MYSQL_POOL_MAX` | `10` | 连接池最大连接数 |
 | `JWT_EXPIRE_HOURS` | `24` | Token 过期时间 |
+

@@ -41,6 +41,7 @@ async def send_message(req: ChatRequest, user: dict = Depends(get_current_user))
             answer = await asyncio.to_thread(
                 rag.invoke, req.question, req.session_id
             )
+            # 这边yield实现的是伪流式，是为了配合StreamingResponse，返回给前端的是json格式的
             yield f"data: {json.dumps({'type': 'answer', 'content': answer}, ensure_ascii=False)}\n\n"
             yield f"data: {json.dumps({'type': 'done'})}\n\n"
         except Exception as e:
@@ -48,7 +49,7 @@ async def send_message(req: ChatRequest, user: dict = Depends(get_current_user))
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
-        event_stream(),
+        event_stream(),# 这里返回异步生成器对象，对应上面的yield
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

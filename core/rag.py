@@ -28,6 +28,7 @@ SYSTEM_PROMPT = (
 
 class RagService:
     def __init__(self):
+        # 初始化各类模块
         self.vector_service = VectorStoreService(
             embedding=DashScopeEmbeddings(model="text-embedding-v4")
         )
