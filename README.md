@@ -375,7 +375,7 @@ WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗�
 - **检索流程（v2.2.0）**：query → 向量路（top-8）+ BM25 路（top-8）→ RRF 融合 → 按父块去重 → CrossEncoder 重排序 → 取 top-4 父块 → MySQL 查完整父块内容 → 拼入 LLM prompt。
 
 ```mermaid
-flowchart LR
+flowchart TD
     Query(["🔍 用户查询 query"]) --> Tokenize["结巴分词<br/>jieba.lcut_for_search"]
 
     Tokenize --> VecPath["向量路<br/>ChromaDB similarity_search"]
