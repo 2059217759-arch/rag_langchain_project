@@ -1,6 +1,8 @@
 import os
 import re
+import time
 import hashlib
+import logging
 import threading
 from datetime import datetime
 
@@ -10,7 +12,10 @@ from langchain_community.embeddings import DashScopeEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core import config
+from core.cache import bump_doc_version
 from core.database import insert_parents
+
+logger = logging.getLogger(__name__)
 
 
 def _check_md5(md5_str: str) -> bool:
@@ -175,17 +180,25 @@ class IngestionService:
             child_size=config.CHILD_CHUNK_SIZE,
             child_overlap=config.CHILD_CHUNK_OVERLAP,
         )
+        logger.info(
+            "IngestionService 已初始化 chroma=%s:%d collection=%s",
+            config.CHROMA_HOST, config.CHROMA_PORT, config.COLLECTION_NAME,
+        )
 
     def upload_by_str(self, data: str, file_name: str) -> str:
         md5_hex = _get_string_md5(data)
 
         if _check_md5(md5_hex):
+            logger.info("文件跳过（MD5 重复） file=%s md5=%s", file_name, md5_hex[:8])
             return "[跳过]内容已存在知识库"
         if len(data) < 10:
+            logger.warning("文件过短被拒绝 file=%s len=%d", file_name, len(data))
             return "[失败]内容过短"
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        t0 = time.time()
         parents = self.splitter.split(data)
+        logger.debug("文档切分完成 file=%s parents=%d", file_name, len(parents))
 
         all_children = []
         parent_records = []
@@ -225,6 +238,15 @@ class IngestionService:
             self.chroma.add_texts(list(texts), metadatas=list(metadatas))
 
         _save_md5(md5_hex)
+
+        # 递增文档版本号，使所有检索结果缓存失效
+        bump_doc_version()
+
+        elapsed = time.time() - t0
+        logger.info(
+            "文档入库成功 file=%s parents=%d children=%d elapsed=%.1fs",
+            file_name, len(parent_records), len(all_children), elapsed,
+        )
         return f"[成功]已载入向量库（{len(parent_records)} 个父块，{len(all_children)} 个子块）"
 
 

@@ -1,5 +1,48 @@
 # Changelog
 
+## [v2.8.0] — 2026-07-03
+
+### 移除
+
+- **对话摘要机制**：删除 `RagService._maybe_update_summary()` 及 `chat_summary` 表。DeepSeek V4 Pro 支持 128K context，项目典型对话场景（15 轮以内）不需要摘要压缩，直接扩大窗口更简单可靠
+- **摘要模型实例**：`RagService` 不再初始化独立的 `summarizer_model`，每次对话减少一次 LLM 调用
+
+### 变更
+
+- **滑动窗口扩大**：`WINDOW_SIZE` 从 10 扩至 30（约 15 轮对话），上下文信息保真度更高
+- **提前持久化用户消息**：`RagService.invoke()` 在 Agent 循环启动前将 `HumanMessage` 写入 MySQL，防止 Agent 中途崩溃导致用户问题丢失
+- **`storage/chat_history.py`**：移除 `get_summary()` / `save_summary()` / `get_messages_in_range()` 三个摘要相关静态方法；`clear()` 不再清理 `chat_summary` 表
+- **`core/database.py`**：`_init_db()` 不再创建 `chat_summary` 表
+- **`core/config.py`**：`WINDOW_SIZE` 默认值 10 → 30
+
+### 修复
+
+- **静默吞异常**：`_maybe_update_summary()` 中 `except: pass` 随方法一并删除，不再有隐晦的摘要失败
+- **会话归属校验**：`GET /api/chat/history` 和 `DELETE /api/chat/clear` 增加 `session_id` 归属检查，防止用户越权访问他人会话（403 Forbidden）
+
+### 新增
+
+- **Redis 三层缓存**：新增 `core/cache.py`，在检索链路关键节点引入缓存，减少重复计算和外部 API 调用：
+  - **Layer 1 — EmbeddingCache**（`rag:emb:{md5}`）：缓存 query → 768-dim 向量映射，TTL 24h，命中时跳过 DashScope API 调用
+  - **Layer 2 — RerankerCache**（`rag:rerank:{md5}`）：缓存 (query, doc) → 相关性分数，TTL 1h，命中时跳过 CrossEncoder 推理
+  - **Layer 3 — SearchResultCache**（`rag:search:v{ver}:{md5}`）：缓存 query → 完整检索上下文，TTL 10min，命中时跳过全部检索链路
+  - **文档版本管理**：`rag:doc_version` 原子递增，文档入库后自动使 SearchResultCache 失效
+  - **优雅降级**：Redis 不可用时所有缓存自动降级为 no-op，不影响核心问答功能
+- **缓存监控端点**：`GET /api/metrics/cache` 返回各层命中率（hits/misses/hit_rate）
+- **`api/routes/metrics.py`**：新增 `/api/metrics/cache` 路由
+- **`core/config.py`**：新增 Redis 连接配置 + 各层缓存开关/ TTL 配置（均支持环境变量覆盖）
+- **`core/vector_store.py`**：`VectorStoreService` 集成 `EmbeddingCache` 和 `RerankerCache`
+- **`core/rag.py`**：`RagService` 集成 `SearchResultCache`
+- **`core/ingestion.py`**：`upload_by_str()` 成功后调用 `bump_doc_version()` 自动失效缓存
+- **`requirements.txt`**：新增 `redis==5.2.1`
+
+### 清理
+
+- **`core/rag.py`**：移除 `summarizer_model`、`_maybe_update_summary()`、`get_connection` import；`SYSTEM_PROMPT` 去掉 `{summary}` 占位符
+- **`core/database.py`**：移除 `chat_summary` 建表语句
+
+---
+
 ## [v2.7.0] — 2026-06-10
 
 ### 新增

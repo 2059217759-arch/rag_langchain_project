@@ -1,4 +1,4 @@
-# RAG 智能助手 <sup>v2.7.0</sup>
+# RAG 智能助手 <sup>v2.8.0</sup>
 
 基于 FastAPI + LangChain + Streamlit 的 RAG 高并发问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
 
@@ -7,8 +7,7 @@
 - **用户注册/登录** — JWT 认证 + bcrypt 密码哈希
 - **文件上传入库** — 文本/Markdown 文件自动分段 → 向量化 → ChromaDB，支持 MD5 去重，父子块分层存储
 - **Agent 智能问答** — ReAct 范式，LLM 自主决定是否检索、检索什么、检索几次，BM25 + 向量混合检索 + CrossEncoder 重排序
-- **滑动窗口上下文** — 只保留最近 K 条完整消息，避免上下文爆炸
-- **对话摘要** — 超出窗口的历史消息自动压缩为摘要，增量更新，恒定成本
+- **滑动窗口上下文** — 保留最近 30 条消息（≈15 轮对话），扩大窗口避免上下文丢失
 - **历史会话记录** — 侧边栏查看最近 10 轮对话，从 MySQL 持久化读取，跨会话保留
 - **性能监控仪表盘** — 延迟分布、Token 趋势、工具调用统计、缓存命中率，结构化 metrics 持久化到 MySQL
 - **高并发架构** — FastAPI async 路由 + 线程池执行同步逻辑 + ChromaDB Server + MySQL 连接池
@@ -21,10 +20,11 @@
 |------|------|
 | 后端 | FastAPI (async) + uvicorn |
 | 前端 | Streamlit（纯 UI 层，通过 httpx 调 API） |
-| LLM | DeepSeek V4 Pro（对话 + 摘要，OpenAI 兼容 API） |
+| LLM | DeepSeek V4 Pro（对话，OpenAI 兼容 API） |
 | Embedding | DashScope text-embedding-v4 |
 | 向量库 | ChromaDB（Client/Server 模式，独立进程） |
 | 数据库 | MySQL 5.7+（DBUtils 连接池） |
+| 缓存 | Redis 6.0+（三层缓存：Embedding / 检索结果 / Reranker） |
 | 检索 | BM25（jieba）+ ChromaDB 向量 → RRF 融合 |
 | 重排序 | BCE-Reranker-Base-V1（本地部署） |
 | 认证 | JWT (HS256) + bcrypt |
@@ -56,9 +56,12 @@ rag_project/
 │   ├── rag.py                  # RagService 单例 + Agent 循环
 │   ├── ingestion.py            # IngestionService 单例 + 父子块切分
 │   ├── metrics.py              # 性能指标存取（MySQL 持久化 + 聚合查询）
+│   ├── cache.py                 # Redis 缓存层（Embedding / 检索结果 / Reranker 三层缓存）
+│   ├── logging_config.py       # 统一日志配置（RotatingFileHandler + 分级输出）
 │   └── vector_store.py         # ChromaDB (HttpClient) + BM25 + Reranker
 ├── storage/
-│   └── chat_history.py         # MySQL 对话历史持久化 + 摘要存取
+│   └── chat_history.py         # MySQL 对话历史持久化（滑动窗口）
+├── logs/                       # 应用日志（app.log / error.log / debug.log，自动轮转）
 ├── data/
 │   ├── chroma_db/              # ChromaDB 持久化目录（由 chroma server 管理）
 │   ├── bm25_index.pkl          # BM25 索引磁盘缓存
@@ -101,7 +104,7 @@ graph TB
     subgraph External["☁️ 外部服务"]
         ChromaDB[("ChromaDB Server<br/>:8001<br/>HTTP 并发读写")]
         MySQL[("MySQL 5.7+<br/>DBUtils 连接池<br/>min=2 · max=10")]
-        DeepSeek["DeepSeek V4 Pro<br/>对话 + 摘要"]
+        DeepSeek["DeepSeek V4 Pro<br/>对话"]
         DashScope["DashScope API<br/>text-embedding-v4"]
     end
 
@@ -159,14 +162,6 @@ graph TB
 | message | JSON | LangChain 消息格式 |
 | created_at | DATETIME | 消息时间 |
 
-### chat_summary
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| session_id | VARCHAR(128) PK | 会话 ID |
-| summary | TEXT | 旧消息的对话摘要 |
-| last_summarized_msg_id | BIGINT | 已摘要到的消息 ID 上限 |
-| updated_at | DATETIME | 最后更新 |
-
 ### document_parents
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -206,6 +201,7 @@ FastAPI 启动后访问 `http://localhost:8000/docs` 查看 Swagger UI。
 | POST | `/api/upload` | 上传文件到知识库 |
 | GET | `/api/metrics/summary?days=7` | 性能指标汇总 |
 | GET | `/api/metrics/recent?limit=50` | 最近查询明细 |
+| GET | `/api/metrics/cache` | Redis 缓存命中率 |
 
 ## 快速开始
 
@@ -242,9 +238,18 @@ MYSQL_DATABASE=rag_db
 CHROMA_HOST=127.0.0.1
 CHROMA_PORT=8001
 
+# Redis (v2.8.0)
+REDIS_HOST=127.0.0.1
+REDIS_PORT=6379
+REDIS_DB=0
+# REDIS_PASSWORD=  # 可选，生产环境建议设置
+
 # JWT
 JWT_SECRET_KEY=your-secret-key-change-in-production
 JWT_EXPIRE_HOURS=24
+
+# 日志（可选，默认 INFO）
+LOG_LEVEL=INFO
 ```
 
 ### 4. 启动
@@ -253,10 +258,13 @@ JWT_EXPIRE_HOURS=24
 # 1. 启动 ChromaDB Server（独立进程）
 chroma run --path data/chroma_db --port 8001 &
 
-# 2. 启动 FastAPI
+# 2. 确保 Redis 已启动（默认 localhost:6379）
+redis-server --daemonize yes
+
+# 3. 启动 FastAPI
 uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
 
-# 3. 启动 Streamlit（纯前端 UI）
+# 4. 启动 Streamlit（纯前端 UI）
 streamlit run app/login_page.py
 ```
 
@@ -269,7 +277,7 @@ streamlit run app/login_page.py
 
 ## 上下文管理机制
 
-为了避免对话变长导致 prompt 超出 LLM 上下文窗口，系统使用 **滑动窗口 + 对话摘要** 双层机制。
+系统使用**滑动窗口**机制管理对话上下文，在窗口容量和内存消耗之间取得平衡。
 
 ### 记忆框架架构
 
@@ -280,51 +288,43 @@ LangChain 提供了两类记忆/对话历史方案：
 | `ConversationBufferMemory` / `ConversationBufferWindowMemory` / `ConversationSummaryBufferMemory` | `langchain.memory`（旧版 API） | `LLMChain` / `ConversationChain` 体系 |
 | `BaseChatMessageHistory` + `RunnableWithMessageHistory` | `langchain_core`（LCEL 新架构） | `create_react_agent` + `AgentExecutor` 体系 |
 
-本项目采用 **LCEL 新架构**，不直接使用旧版 `Conversation*Memory` 类，而是通过继承 `BaseChatMessageHistory` 自行实现了等价的三种记忆模式：
+本项目采用 **LCEL 新架构**，通过继承 `BaseChatMessageHistory` 自行实现滑动窗口记忆：
 
 ```
 RunnableWithMessageHistory   ← 框架层：链执行前后自动调用 memory.add_messages / memory.messages
         ↑
 BaseChatMessageHistory       ← 抽象接口：add_messages / messages / clear
         ↑
-MySQLChatMessageHistory      ← 自定义实现：MySQL 持久化 + 滑动窗口 + 摘要存取
+MySQLChatMessageHistory      ← 自定义实现：MySQL 持久化 + 滑动窗口
 ```
 
-三种记忆模式的对应关系：
+与 LangChain 旧版类的对应关系：
 
 | LangChain 旧版类 | 本项目等价实现 | 机制 |
 |-----------------|--------------|------|
 | `ConversationBufferMemory` | `MySQLChatMessageHistory.messages`（不加 LIMIT 即为全量） | 存储完整对话历史 |
-| `ConversationBufferWindowMemory`（K 轮） | `WINDOW_SIZE = 10`，SQL `LIMIT 10`（约 5 轮） | 只保留最近 K 条消息 |
-| `ConversationSummaryBufferMemory` | `_maybe_update_summary()` + `chat_summary` 表 | 超长历史用 LLM 增量摘要压缩 |
+| `ConversationBufferWindowMemory`（K 轮） | `WINDOW_SIZE = 30`，SQL `LIMIT 30`（约 15 轮） | 只保留最近 K 条消息 |
 
 采用 LCEL 架构的优势：
 
 - **持久化自由** — 旧版 Memory 默认存内存，重启即丢；本项目直接写入 MySQL，跨会话持久化
-- **摘要与对话解耦** — `{summary}` 和 `{chat_history}` 是独立占位符，提示词模板更清晰
-- **增量摘要** — `last_summarized_msg_id` 标记实现增量更新，每次只摘要新溢出消息，旧版无此能力
 - **Agent 原生兼容** — 旧版 Memory 对接 `create_react_agent` + `AgentExecutor` 需要额外适配层
+- **提前持久化** — 用户消息在 Agent 循环启动前即写入数据库，避免中途崩溃导致问题丢失
 
 ### 滑动窗口
 
-`MySQLChatMessageHistory.messages` 只返回最近 `WINDOW_SIZE`（默认 10）条消息，等效于 5 轮问答。这部分以完整的 LangChain 消息格式注入 prompt 的 `history` 占位符。
+`MySQLChatMessageHistory.messages` 只返回最近 `WINDOW_SIZE`（默认 30）条消息，等效于约 15 轮问答。对话超过窗口时，最早的消息自然丢弃，通过扩大窗口（从 v2.7 的 10 条增加到 v2.8 的 30 条）保留更多近期上下文。
 
-### 对话摘要
+> DeepSeek V4 Pro 支持 128K context，30 条消息仅占约 2-3 万 token，远未触及上限。对于本项目的典型使用场景（15 轮以内的问答），直接扩大窗口比摘要压缩更简单可靠。
 
-窗口之外的旧消息不会直接丢弃，而是通过 `RagService._maybe_update_summary()` 自动压缩：
+### Agent 推理流程
 
-1. **触发时机**：每次 `invoke()` 完成后自动执行，无需 UI 层关心
-2. **增量更新**：只取新溢出窗口的消息，与已有摘要合并，LLM 生成 300 字以内的综合摘要
-3. **恒定成本**：摘要长度上限 300 字，不论对话多长，每次摘要调用成本 O(1)
-4. **失败容忍**：摘要异常被静默捕获，不影响主对话流程
-
-### Agent 推理流程（v2.5.0）
-
-系统采用原生 Function Calling 替代文本模拟 ReAct，LLM 通过结构化 JSON 决定是否调用工具：
+系统采用原生 Function Calling，LLM 通过结构化 JSON 决定是否调用工具：
 
 ```mermaid
 flowchart TD
-    Start(["💬 用户提问"]) --> BuildMsg["构建消息列表<br/>SystemMessage + 历史消息 + HumanMessage"]
+    Start(["💬 用户提问"]) --> PersistUser["💾 提前持久化 HumanMessage<br/>防止崩溃丢失"]
+    PersistUser --> BuildMsg["构建消息列表<br/>SystemMessage + 历史消息 + HumanMessage"]
     BuildMsg --> BindTools["ChatOpenAI.bind_tools<br/>search_knowledge_base"]
     BindTools --> LLMCall["LLM 调用 (DeepSeek V4 Pro)"]
 
@@ -340,21 +340,16 @@ flowchart TD
     CheckIter -- "是 → 继续" --> LLMCall
     CheckIter -- "否 → 超时兜底" --> Timeout["返回超时兜底回答"]
 
-    Final --> SaveHistory["💾 保存对话到 MySQL<br/>chat_history 表"]
-    Timeout --> SaveHistory
-
-    SaveHistory --> CheckWindow{"消息数 &gt; WINDOW_SIZE?"}
-    CheckWindow -- "是" --> UpdateSummary["📝 LLM 增量更新摘要<br/>写入 chat_summary 表"]
-    CheckWindow -- "否" --> Done(["✅ 完成"])
-
-    UpdateSummary --> Done
+    Final --> SaveAI["💾 持久化 AIMessage<br/>chat_history 表"]
+    Timeout --> SaveAI
+    SaveAI --> Done(["✅ 完成"])
 
     style Start fill:#4CAF50,color:#fff
     style Final fill:#2196F3,color:#fff
     style Done fill:#4CAF50,color:#fff
     style Search fill:#FF9800,color:#fff
-    style SaveHistory fill:#9C27B0,color:#fff
-    style UpdateSummary fill:#FF5722,color:#fff
+    style PersistUser fill:#9C27B0,color:#fff
+    style SaveAI fill:#9C27B0,color:#fff
 ```
 
 对于简单问候，LLM 自动跳过工具调用直接回复，避免不必要的检索开销。
@@ -363,7 +358,138 @@ flowchart TD
 
 ```python
 # core/config.py
-WINDOW_SIZE = 10   # 滑动窗口大小，可调大以适应更大上下文窗口的模型
+WINDOW_SIZE = 30   # 滑动窗口大小，约 15 轮问答
+```
+
+## Redis 缓存架构（v2.8.0）
+
+系统在检索链路的三处关键节点引入 Redis 缓存，减少重复计算和外部 API 调用。
+
+### 分层架构
+
+```mermaid
+graph TB
+    User["💬 用户提问"] --> Agent["🤖 Agent 循环"]
+
+    Agent --> SRCache{"Layer 3<br/>SearchResultCache<br/>━━━━━━━━━━<br/>Key: md5(query + doc_version)<br/>TTL: 10 min"}
+    SRCache -- "✅ HIT" --> Hit3["⚡ 直接返回<br/>跳过全部检索"]
+    SRCache -- "❌ MISS" --> HS["🔍 hybrid_search(query)"]
+
+    HS --> VecSim["similarity_search"]
+    VecSim --> EmbCache{"Layer 1<br/>EmbeddingCache<br/>━━━━━━━━━━<br/>Key: md5(query)<br/>TTL: 24h"}
+    EmbCache -- "✅ HIT" --> VecResult["复用已缓存的向量"]
+    EmbCache -- "❌ MISS" --> DashScope["DashScope API<br/>text-embedding-v4"]
+    DashScope --> VecResult
+
+    VecResult --> BM25["BM25 关键词检索"]
+    BM25 --> RRF["RRF 融合"]
+    RRF --> Rerank["rerank(query, docs)"]
+
+    Rerank --> RRCache{"Layer 2<br/>RerankerCache<br/>━━━━━━━━━━<br/>Key: md5(query + doc)<br/>TTL: 1h"}
+    RRCache -- "✅ HIT" --> RerankResult["复用已缓存的分数"]
+    RRCache -- "❌ MISS" --> CE["BCE-Reranker<br/>CrossEncoder 推理"]
+    CE --> RerankResult
+
+    RerankResult --> MySQL["MySQL 查父块"]
+    MySQL --> Context["拼接 context"]
+    Context --> CacheWrite["💾 写入 Layer 3"]
+    CacheWrite --> Return["返回给 LLM"]
+
+    Hit3 --> Return
+
+    subgraph Redis["🟥 Redis"]
+        EmbCache
+        SRCache
+        RRCache
+    end
+
+    style Hit3 fill:#4CAF50,color:#fff
+    style SRCache fill:#FF5722,color:#fff
+    style EmbCache fill:#2196F3,color:#fff
+    style RRCache fill:#9C27B0,color:#fff
+    style Redis fill:#f5f5f5,stroke:#dc382c,stroke-width:3px
+    style DashScope fill:#FF9800,color:#fff
+    style CE fill:#FF9800,color:#fff
+```
+
+### 三层缓存详解
+
+| 层级 | 类 | 缓存内容 | Key | TTL | 命中收益 |
+|------|-----|---------|------|-----|---------|
+| **Layer 1** | `EmbeddingCache` | text → 768-dim 向量 | `rag:emb:{md5(text)}` | 24h | 跳过 DashScope API 调用（~100-300ms） |
+| **Layer 2** | `RerankerCache` | (query, doc) → 相关性分数 | `rag:rerank:{md5(query+doc)}` | 1h | 跳过 CrossEncoder 推理（~50-200ms） |
+| **Layer 3** | `SearchResultCache` | query → 完整检索上下文 | `rag:search:v{ver}:{md5(q)}` | 10min | 跳过全部三层：embedding + 检索 + rerank |
+
+Layer 1 和 Layer 2 是**确定性缓存**（相同输入永远返回相同结果），不随文档更新而失效。Layer 3 是**版本化缓存**，Key 包含 `doc_version`，确保文档入库后自动失效。
+
+### 文档版本管理
+
+```
+文档上传 → bump_doc_version()
+              │
+              ▼
+         Redis INCR rag:doc_version  (1 → 2 → 3 → ...)
+              │
+              ▼
+         所有 SearchResultCache 的旧版本 key 自然失效
+         (rag:search:v1:* 不会被查询，因为 get() 取的是当前版本号)
+```
+
+- `get_doc_version()` — 读取当前版本号（首次启动自动初始化为 1）
+- `bump_doc_version()` — 原子递增（`INCR`），每次文件入库成功后调用
+- EmbeddingCache 和 RerankerCache **不受版本号影响**（它们的输出是确定性函数）
+
+### 降级策略
+
+Redis 不可用时（进程未启动、网络不通、OOM），所有缓存自动降级为 no-op，不影响核心问答功能：
+
+```python
+# core/cache.py 关键保护机制
+def _redis_ok() -> bool:
+    """连接失败 → 所有 cache.enabled = False → 走原始路径"""
+    try:
+        return get_redis_client().ping()
+    except Exception:
+        return False
+
+def _safe_redis(callable, default=None):
+    """单次操作异常 → 静默返回 default，不影响上层逻辑"""
+    try:
+        return callable()
+    except Exception:
+        logger.debug("Redis 操作异常（已降级）", exc_info=True)
+        return default
+```
+
+### 监控
+
+`GET /api/metrics/cache` 返回各层命中率：
+
+```json
+{
+  "doc_version": 3,
+  "embedding": {"hits": 150, "misses": 30, "hit_rate": 0.8333},
+  "search":    {"hits": 40,  "misses": 20, "hit_rate": 0.6667},
+  "rerank":    {"hits": 80,  "misses": 40, "hit_rate": 0.6667}
+}
+```
+
+### 相关配置
+
+```python
+# core/config.py — Redis 连接
+REDIS_HOST = "127.0.0.1"
+REDIS_PORT = 6379
+REDIS_DB = 0
+REDIS_SOCKET_TIMEOUT = 2.0
+
+# 各层开关和 TTL（均可通过环境变量覆盖）
+EMBEDDING_CACHE_ENABLED = True    # EMBEDDING_CACHE_ENABLED=false 关闭
+EMBEDDING_CACHE_TTL = 86400       # EMBEDDING_CACHE_TTL=86400
+SEARCH_CACHE_ENABLED = True
+SEARCH_CACHE_TTL = 600
+RERANKER_CACHE_ENABLED = True
+RERANKER_CACHE_TTL = 3600
 ```
 
 ## 文档分块策略（v2.1.0）
@@ -408,7 +534,7 @@ flowchart TD
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 地址 |
 | `MAX_ITERATIONS` | `8` | Agent 最大工具调用轮数 |
 | `MAX_EXECUTION_TIME` | `120` | Agent 最大执行时间（秒） |
-| `WINDOW_SIZE` | `10` | 滑动窗口消息条数 |
+| `WINDOW_SIZE` | `30` | 滑动窗口消息条数（约 15 轮对话） |
 | `PARENT_MAX_SIZE` | `4000` | 父块目标大小上限（字符） |
 | `CHILD_CHUNK_SIZE` | `300` | 子块大小（用于向量检索） |
 | `CHILD_CHUNK_OVERLAP` | `50` | 子块重叠量 |
@@ -423,5 +549,96 @@ flowchart TD
 | `CHROMA_PORT` | `8001` | ChromaDB Server 端口 |
 | `MYSQL_POOL_MIN` | `2` | 连接池最小连接数 |
 | `MYSQL_POOL_MAX` | `10` | 连接池最大连接数 |
+| `REDIS_HOST` | `127.0.0.1` | Redis 地址 |
+| `REDIS_PORT` | `6379` | Redis 端口 |
+| `REDIS_DB` | `0` | Redis 数据库编号 |
+| `REDIS_SOCKET_TIMEOUT` | `2.0` | Redis 操作超时（秒） |
+| `EMBEDDING_CACHE_ENABLED` | `true` | 启用 Embedding 缓存 |
+| `EMBEDDING_CACHE_TTL` | `86400` | Embedding 缓存过期时间（秒，默认 24h） |
+| `SEARCH_CACHE_ENABLED` | `true` | 启用检索结果缓存 |
+| `SEARCH_CACHE_TTL` | `600` | 检索结果缓存过期时间（秒，默认 10min） |
+| `RERANKER_CACHE_ENABLED` | `true` | 启用 Reranker 缓存 |
+| `RERANKER_CACHE_TTL` | `3600` | Reranker 缓存过期时间（秒，默认 1h） |
 | `JWT_EXPIRE_HOURS` | `24` | Token 过期时间 |
+| `LOG_LEVEL` | `INFO` | 日志级别（DEBUG / INFO / WARNING / ERROR） |
+
+## 日志系统
+
+所有日志统一输出到 `logs/` 目录，通过 Python `logging` 模块 + `RotatingFileHandler` 管理。单文件上限 **10 MB**，保留 **5** 个滚动备份，不会无限增长。
+
+### 日志目录
+
+```
+logs/
+├── app.log        # INFO 及以上 — 正常运维日志
+├── error.log      # WARNING 及以上 — 告警和错误（排查问题第一时间看这里）
+├── debug.log      # DEBUG 及以上 — 全量调试日志（仅 LOG_LEVEL=DEBUG 时详细）
+└── llm_trace.log  # LLM 请求/响应原始 JSON — 每轮迭代的完整收发记录
+```
+
+### 各级别记录内容
+
+| 级别 | 输出文件 | 记录内容 |
+|------|---------|---------|
+| **DEBUG** | `debug.log` | 每轮 LLM 迭代的 finish_reason、tool_calls、本轮 token 用量（input/output/cache_read/reasoning）；向量检索 / BM25 命中 / RRF 融合的中间结果；BM25 缓存命中判断；数据库连接池状态 |
+| **INFO** | `app.log` | 服务启动/关闭；每次 invoke 汇总（session、耗时、总 token、工具调用次数）；文档入库成功（文件、父块数、子块数）；上传请求；会话创建；BM25 索引重建 |
+| **WARNING** | `error.log` | Agent 超时；检索无结果；metrics 写入 MySQL 失败；BM25 磁盘缓存加载失败（自动降级）；文件编码不支持 |
+| **ERROR** | `error.log` | 未捕获异常（`exc_info=True` 附完整堆栈）；数据库初始化失败；问答流程异常；文件入库失败 |
+
+### LLM 追踪日志
+
+`logs/llm_trace.log` 独立于日志级别，**始终记录**每次 LLM 调用的完整请求和响应 JSON：
+
+```
+══════ iter0 REQUEST session=wql_abc12345 ══════
+[
+  {
+    "type": "system",
+    "content": "你是一个智能对话助手。..."
+  },
+  {
+    "type": "human",
+    "content": "Python 有哪些分支结构？"
+  }
+]
+══════ iter0 RESPONSE session=wql_abc12345 (2.3s) ══════
+{
+  "type": "ai",
+  "content": "",
+  "tool_calls": [
+    {
+      "name": "search_knowledge_base",
+      "args": {"query": "Python 分支结构"},
+      "id": "call_xxx"
+    }
+  ],
+  "usage_metadata": {
+    "input_tokens": 520,
+    "output_tokens": 45,
+    "input_token_details": {"cache_read": 480},
+    "output_token_details": {"reasoning": 0}
+  }
+}
+```
+
+每一轮 Agent 迭代对应一对 `REQUEST` / `RESPONSE`。REQUEST 是发给 LLM 的完整消息列表（包括 system prompt、历史消息、工具返回结果），RESPONSE 是 LLM 返回的原始结构化 JSON。排查工具调用参数错误、prompt 异常、token 用量异常时直接看这个文件。
+
+### 调试模式
+
+```bash
+# 设置环境变量即可，无需改代码
+export LOG_LEVEL=DEBUG
+```
+
+设为 `DEBUG` 后，每轮 Agent 迭代会记录完整的 LLM 响应元数据和 token 用量明细，方便排查工具调用问题。生产环境保持默认 `INFO` 即可。
+
+### 与 metrics 的关系
+
+日志和 MySQL metrics **互补但不重复**：
+
+- **`logs/app.log`** — 人类可读的摘要，排查问题时快速扫一眼，看哪个请求慢了、哪个报错了
+- **MySQL `metrics` 表** — 结构化数据，供 Streamlit 仪表盘画图（延迟分布、Token 趋势、缓存命中率）
+- **`logs/debug.log`** — 单次请求的每一步中间状态，开发/调试时用
+
+三者记录同一批指标（耗时、token、工具调用），但用途不同：日志用于定位问题，metrics 用于量化分析。
 

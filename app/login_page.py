@@ -4,9 +4,12 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import streamlit as st
-import httpx # 这是一个 HTTP 客户端库
+import httpx
 
 from core import config
+from core.logging_config import setup_logging
+
+setup_logging()
 
 st.set_page_config(page_title="RAG 智能助手", page_icon="🤖", layout="centered")
 

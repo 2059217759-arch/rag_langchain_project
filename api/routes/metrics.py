@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 
 from api.deps import get_current_user
+from core.cache import get_cache_metrics
 from core.metrics import get_metrics_summary, get_recent_metrics
 
 router = APIRouter(prefix="/api/metrics", tags=["metrics"])
@@ -23,3 +24,9 @@ def metrics_recent(
 ):
     """获取最近的查询明细。"""
     return get_recent_metrics(session_id=None, limit=limit)
+
+
+@router.get("/cache")
+def cache_metrics(user: dict = Depends(get_current_user)):
+    """获取 Redis 缓存命中率指标。"""
+    return get_cache_metrics()

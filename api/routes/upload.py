@@ -27,8 +27,10 @@ async def upload_file(
     try:
         text = content.decode("utf-8")
     except UnicodeDecodeError:
+        logger.warning("文件编码错误 file=%s user=%s", file.filename, user["username"])
         raise HTTPException(status_code=400, detail="文件编码不支持，请使用 UTF-8")
 
+    logger.info("收到上传请求 file=%s size=%d user=%s", file.filename, len(text), user["username"])
     service = get_ingestion_service()
     result = service.upload_by_str(data=text, file_name=file.filename or "unknown")
 

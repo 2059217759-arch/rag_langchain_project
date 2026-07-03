@@ -20,6 +20,9 @@ env/
 # Runtime data
 data/
 
+# Logs
+logs/
+
 # Environment variables
 .env
 .env.local

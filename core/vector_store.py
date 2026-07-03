@@ -1,33 +1,44 @@
 import os
 import pickle
+import logging
 import threading
+import time
+from typing import List, Optional
 
 import chromadb
-import jieba 
+import jieba
 from langchain_core.documents import Document
 from langchain_chroma import Chroma
 from rank_bm25 import BM25Okapi
 
 from core import config
+from core.cache import EmbeddingCache, RerankerCache
+
+logger = logging.getLogger(__name__)
 
 
 class VectorStoreService: # 向量存储服务
     def __init__(self, embedding):
-        self.embedding = embedding #嵌入模型
-        # 创建ChromaDB客户端
+        self.embedding = embedding
+        # 包装 embedding，自动缓存 text → vector 映射到 Redis
+        self._cached_embedding = EmbeddingCache(embedding)
         _client = chromadb.HttpClient(host=config.CHROMA_HOST, port=config.CHROMA_PORT)
         self.vector_store = Chroma(
-            # 意思是向量存储服务会调用刚刚定义的客户端接口，同时你需要在终端开启chroma服务器
-            client=_client, 
+            client=_client,
             collection_name=config.COLLECTION_NAME,
-            embedding_function=embedding,
+            embedding_function=self._cached_embedding,
         )
         self._bm25 = None
         self._bm25_texts = None
         self._bm25_metadatas = None
         self._bm25_doc_count = 0
-        self._bm25_lock = threading.Lock() # 创建锁对象
+        self._bm25_lock = threading.Lock()
         self._reranker = None
+        self._reranker_cache = RerankerCache()
+        logger.info(
+            "VectorStoreService 已初始化 chroma=%s:%d collection=%s",
+            config.CHROMA_HOST, config.CHROMA_PORT, config.COLLECTION_NAME,
+        )
 
     # ── BM25 index management ──────────────────────────
     #  判断是否需要重建BM25索引
@@ -44,22 +55,21 @@ class VectorStoreService: # 向量存储服务
             self._bm25_metadatas = []
             self._bm25_doc_count = 0
             return
-        
+
         # 加载磁盘索引文件，如果文档数量未变则复用
         if os.path.exists(config.BM25_INDEX_PATH):
             try:
                 with open(config.BM25_INDEX_PATH, "rb") as f:
-                    # pickle.loads这是执行反序列化的函数调用。它会读取文件句柄 f 
-                    # 中的字节流内容，并自动识别写入时使用的协议版本，将其还原为完整的原始数据结构。
-                    cache = pickle.load(f) 
+                    cache = pickle.load(f)
                 if cache.get("doc_count") == actual_count:
                     self._bm25 = cache["index"]
                     self._bm25_texts = cache["texts"]
                     self._bm25_metadatas = cache["metadatas"]
                     self._bm25_doc_count = actual_count
+                    logger.debug("BM25 索引缓存命中 doc_count=%d", actual_count)
                     return
-            except Exception: 
-                pass
+            except Exception:
+                logger.warning("BM25 缓存加载失败，将重建索引", exc_info=True)
 
         # 从 ChromaDB 全量拉取，构建 BM25
         raw = self.vector_store.get() # 从 ChromaDB 中获取所有数据
@@ -93,6 +103,7 @@ class VectorStoreService: # 向量存储服务
         self._bm25_texts = texts
         self._bm25_metadatas = metadatas
         self._bm25_doc_count = actual_count
+        logger.info("BM25 索引重建完成 doc_count=%d", actual_count)
 
     def refresh_bm25(self):
         """ingestion 写入新文档后调用，强制重建 BM25 索引。"""
@@ -102,6 +113,7 @@ class VectorStoreService: # 向量存储服务
     # 相似度检索BM25和向量检索
 
     def hybrid_search(self, query: str, top_k: int = None) -> list[Document]:
+        t0 = time.time()
         if self._bm25_needs_rebuild():
             with self._bm25_lock:
                 if self._bm25_needs_rebuild():
@@ -111,7 +123,6 @@ class VectorStoreService: # 向量存储服务
         bm25_k = config.TOP_K_BM25
 
         # ── 向量路 ──
-        # 得到父块列表
         vector_docs = self.vector_store.similarity_search(query, k=vec_k)
 
         # ── BM25 路 ──
@@ -153,17 +164,46 @@ class VectorStoreService: # 向量存储服务
         # 排序，根据RRF分数从高到低排序，返回最终的文档列表，每个元素都是一个Document对象
         # 里面存储了子块内容、元数据等信息
         sorted_keys = sorted(rrf_scores, key=rrf_scores.get, reverse=True)
-        return [doc_map[key] for key in sorted_keys]
+        result = [doc_map[key] for key in sorted_keys]
+
+        logger.debug(
+            "混合检索完成 query=%s vector=%d bm25=%d fusion=%d elapsed=%dms",
+            query[:80], len(vector_docs), len(bm25_docs), len(result),
+            int((time.time() - t0) * 1000),
+        )
+        return result
 
     # ── Reranker ──────────────────────────────────────
 
     def rerank(self, query: str, documents: list[str]) -> list[float]:
-        """用 CrossEncoder 对候选文档列表重新打分，返回分数列表。"""
+        """用 CrossEncoder 对候选文档列表重新打分，返回分数列表。
+
+        优先从 Redis 缓存读取，未命中时调用模型推理并回写缓存。
+        """
+        # 1. 查缓存
+        cached_scores = self._reranker_cache.get_scores(query, documents)
+
+        # 2. 找出未命中的索引
+        uncached_idx = [i for i, s in enumerate(cached_scores) if s is None]
+        if not uncached_idx:
+            return cached_scores  # 全部命中
+
+        # 3. 对未命中的调用 CrossEncoder 推理
         if self._reranker is None:
             from sentence_transformers import CrossEncoder
             self._reranker = CrossEncoder(config.RERANKER_MODEL)
-        pairs = [[query, doc] for doc in documents]
-        return self._reranker.predict(pairs).tolist()
+
+        uncached_docs = [documents[i] for i in uncached_idx]
+        pairs = [[query, doc] for doc in uncached_docs]
+        fresh_scores = self._reranker.predict(pairs).tolist()
+
+        # 4. 回写缓存
+        self._reranker_cache.set_scores(query, uncached_docs, fresh_scores)
+
+        # 5. 合并结果
+        for i, score in zip(uncached_idx, fresh_scores):
+            cached_scores[i] = score
+        return cached_scores
 
     # ── LangChain retriever (for backward compat) ──────
 

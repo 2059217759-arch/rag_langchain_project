@@ -61,43 +61,6 @@ class MySQLChatMessageHistory(BaseChatMessageHistory):
                     "DELETE FROM chat_history WHERE session_id = %s",
                     (self.session_id,),
                 )
-                cur.execute(
-                    "DELETE FROM chat_summary WHERE session_id = %s",
-                    (self.session_id,),
-                )
-            conn.commit()
-        finally:
-            conn.close()
-
-    # ── Summary helpers (static, callable from RagService) ──
-    # 这些方法不依赖实例状态，可以直接通过类调用，方便 RagService 在处理对话时进行摘要相关的操作
-    @staticmethod
-    def get_summary(session_id: str) -> str | None:
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT summary FROM chat_summary WHERE session_id = %s",
-                    (session_id,),
-                )
-                row = cur.fetchone()
-            return row["summary"] if row else None
-        finally:
-            conn.close()
-
-    @staticmethod
-    def save_summary(session_id: str, summary: str, last_msg_id: int) -> None:
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """INSERT INTO chat_summary (session_id, summary, last_summarized_msg_id)
-                       VALUES (%s, %s, %s)
-                       ON DUPLICATE KEY UPDATE
-                           summary = VALUES(summary),
-                           last_summarized_msg_id = VALUES(last_summarized_msg_id)""",
-                    (session_id, summary, last_msg_id),
-                )
             conn.commit()
         finally:
             conn.close()
@@ -137,21 +100,5 @@ class MySQLChatMessageHistory(BaseChatMessageHistory):
                         "answer": msgs[i + 1].content,
                     })
             return result
-        finally:
-            conn.close()
-
-    @staticmethod
-    def get_messages_in_range(session_id: str, after_id: int, to_id: int) -> list[BaseMessage]:
-        conn = get_connection()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT message FROM chat_history WHERE session_id = %s "
-                    "AND id > %s AND id <= %s ORDER BY id",
-                    (session_id, after_id, to_id),
-                )
-                rows = cur.fetchall() # 获取所有行
-            # 返回消息列表
-            return messages_from_dict([json.loads(row["message"]) for row in rows]) 
         finally:
             conn.close()

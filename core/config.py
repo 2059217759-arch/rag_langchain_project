@@ -39,7 +39,7 @@ MAX_ITERATIONS = 8        # Agent 最大工具调用轮数
 MAX_EXECUTION_TIME = 120  # Agent 最大执行时间（秒）
 
 # ── Chat Window ────────────────────────────────────
-WINDOW_SIZE = 10  # 滑动窗口保留最近消息条数（≈5轮问答）
+WINDOW_SIZE = 30  # 滑动窗口保留最近消息条数（≈15轮问答）
 
 # ── BM25 Index ────────────────────────────────────
 BM25_INDEX_PATH = os.path.join(DATA_DIR, "bm25_index.pkl")
@@ -55,6 +55,29 @@ MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "root")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "rag_db")
 MYSQL_POOL_MIN = int(os.getenv("MYSQL_POOL_MIN", "2"))
 MYSQL_POOL_MAX = int(os.getenv("MYSQL_POOL_MAX", "10"))
+
+# ── Redis ──────────────────────────────────────────
+REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
+REDIS_SOCKET_TIMEOUT = float(os.getenv("REDIS_SOCKET_TIMEOUT", "2.0"))
+
+# ── Cache ──────────────────────────────────────────
+# Embedding 缓存（减少 DashScope API 调用）
+EMBEDDING_CACHE_ENABLED = os.getenv("EMBEDDING_CACHE_ENABLED", "true").lower() == "true"
+EMBEDDING_CACHE_TTL = int(os.getenv("EMBEDDING_CACHE_TTL", "86400"))      # 24h
+EMBEDDING_CACHE_MAX_SIZE = int(os.getenv("EMBEDDING_CACHE_MAX_SIZE", "10000"))
+
+# 检索结果缓存（跳过整个检索链路）
+SEARCH_CACHE_ENABLED = os.getenv("SEARCH_CACHE_ENABLED", "true").lower() == "true"
+SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL", "600"))               # 10min
+SEARCH_CACHE_MAX_SIZE = int(os.getenv("SEARCH_CACHE_MAX_SIZE", "1000"))
+
+# Reranker 分数缓存（减少 CrossEncoder 推理）
+RERANKER_CACHE_ENABLED = os.getenv("RERANKER_CACHE_ENABLED", "true").lower() == "true"
+RERANKER_CACHE_TTL = int(os.getenv("RERANKER_CACHE_TTL", "3600"))          # 1h
+RERANKER_CACHE_MAX_SIZE = int(os.getenv("RERANKER_CACHE_MAX_SIZE", "5000"))
 
 # ── JWT ────────────────────────────────────────────
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "default-secret")

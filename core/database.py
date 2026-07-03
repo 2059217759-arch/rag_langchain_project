@@ -1,8 +1,11 @@
+import logging
 import pymysql
 import threading
 from dbutils.pooled_db import PooledDB
 
 from core import config
+
+logger = logging.getLogger(__name__)
 
 _pool = None
 _initialized = False
@@ -25,6 +28,11 @@ def _get_pool():
                     database=config.MYSQL_DATABASE,
                     charset="utf8mb4",
                     cursorclass=pymysql.cursors.DictCursor,
+                )
+                logger.info(
+                    "MySQL 连接池已创建 host=%s:%d db=%s min=%d max=%d",
+                    config.MYSQL_HOST, config.MYSQL_PORT, config.MYSQL_DATABASE,
+                    config.MYSQL_POOL_MIN, config.MYSQL_POOL_MAX,
                 )
     return _pool
 
@@ -80,6 +88,10 @@ def _init_db():
                 "DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             )
         conn.commit()
+        logger.debug("数据库已确认存在 db=%s", db_name)
+    except Exception:
+        logger.error("数据库初始化失败", exc_info=True)
+        raise
     finally:
         if conn:
             conn.close()
@@ -108,17 +120,6 @@ def _init_db():
                     message     JSON NOT NULL,
                     created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
                     INDEX idx_session_id (session_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
-                """
-            )
-            cur.execute(
-                """
-                CREATE TABLE IF NOT EXISTS chat_summary (
-                    session_id              VARCHAR(128) PRIMARY KEY,
-                    summary                 TEXT,
-                    last_summarized_msg_id  BIGINT DEFAULT 0,
-                    created_at              DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at              DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )

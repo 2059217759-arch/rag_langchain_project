@@ -8,18 +8,18 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_openai import ChatOpenAI
 
 from core import config
-from core.database import get_connection, get_parents_by_ids
+from core.cache import SearchResultCache
+from core.database import get_parents_by_ids
 from core.metrics import save_metrics
 from core.vector_store import VectorStoreService
 from storage.chat_history import MySQLChatMessageHistory
+from langchain_core.messages import message_to_dict
 
-# 导入message_to_dict 函数可以看看invoke转换的jsnon格式。
-from langchain_core.messages import message_to_dict 
-
-logger = logging.getLogger(__name__) # 创建日志记录器
+logger = logging.getLogger(__name__)
+llm_trace = logging.getLogger("llm_trace")
 
 SYSTEM_PROMPT = (
-    "你是一个智能对话助手。{summary}\n\n"
+    "你是一个智能对话助手。\n\n"
     "当需要查找具体信息、数据或参考资料时，使用 search_knowledge_base 工具搜索内部知识库。\n"
     "不需要检索时（闲聊、问候等），直接回答用户问题。\n"
     "用中文回答。"
@@ -37,12 +37,7 @@ class RagService:
             api_key=config.DEEPSEEK_API_KEY,
             base_url=config.DEEPSEEK_BASE_URL,
         )
-        self.summarizer_model = ChatOpenAI(
-            model=config.DEEPSEEK_CHAT_MODEL,
-            api_key=config.DEEPSEEK_API_KEY,
-            base_url=config.DEEPSEEK_BASE_URL,
-        )
-
+        self._search_cache = SearchResultCache()
         # 定义了json格式的工具调用规范，供 Agent 使用。未来可扩展更多工具。
         # Agent 会根据对话上下文自主决定是否调用工具。每次调用后，Agent 会等待工具结果返回，
         # 再继续下一轮对话或工具调用。
@@ -73,9 +68,18 @@ class RagService:
 
     def _search_knowledge_base(self, query: str) -> str:
         """检索 + 重排序 + 拼接 context，返回给 Agent 使用。"""
+        # 优先查缓存（Redis down 时降级为 None）
+        cached = self._search_cache.get(query)
+        if cached is not None:
+            return cached
+
+        ret_t0 = time.time()
         docs = self.vector_service.hybrid_search(query)
         if not docs:
-            return "未找到相关参考资料"
+            logger.warning("检索无结果 query=%s", query[:100])
+            result = "未找到相关参考资料"
+            self._search_cache.set(query, result)
+            return result
 
         seen = set()
         parent_ids = []
@@ -116,7 +120,16 @@ class RagService:
                 formatted.append(f"{title}\n{content}")
             else:
                 formatted.append(content)
-        return "\n\n---\n\n".join(formatted) if formatted else "未找到相关参考资料"
+
+        result = "\n\n---\n\n".join(formatted) if formatted else "未找到相关参考资料"
+        # 写入检索缓存
+        self._search_cache.set(query, result)
+        logger.debug(
+            "检索完成 query=%s docs=%d parents=%d final=%d elapsed=%dms result_len=%d",
+            query[:80], len(docs), len(parent_map), len(formatted),
+            int((time.time() - ret_t0) * 1000), len(result),
+        )
+        return result
 
     def invoke(self, question: str, session_id: str) -> str:
         """执行一次问答。Agent 自主决定是否检索知识库。"""
@@ -130,15 +143,13 @@ class RagService:
         reasoning_tokens = 0
 
         history = MySQLChatMessageHistory(session_id=session_id)
-        chat_messages = history.messages 
+        chat_messages = history.messages
 
-        summary = MySQLChatMessageHistory.get_summary(session_id)
-        summary_text = f"早前对话摘要：\n{summary}" if summary else ""
+        # 提前持久化用户消息，防止 Agent 循环中途崩溃导致丢失
+        history.add_messages([HumanMessage(content=question)])
 
-        # llm遵循严格的时间序列
-        # SystemMessage是系统指令,即对话背景
         messages = [
-            SystemMessage(content=SYSTEM_PROMPT.format(summary=summary_text)),
+            SystemMessage(content=SYSTEM_PROMPT),
         ]
         messages.extend(chat_messages)
         messages.append(HumanMessage(content=question))
@@ -156,15 +167,37 @@ class RagService:
         for i in range(config.MAX_ITERATIONS):  # 最大迭代次数
             if time.time() - t0 > config.MAX_EXECUTION_TIME:  # 超时
                 debug_lines.append(f"iter{i}: TIMEOUT at {time.time()-t0:.1f}s")
+                logger.warning(
+                    "Agent 超时 session=%s iter=%d elapsed=%.1fs",
+                    session_id, i, time.time() - t0,
+                )
                 break
 
             # invoke(messages):这是 LangChain 的标准调用方法。它将 Python 的
             # messages 列表序列化为 JSON，通过 API 发送给 DeepSeek 服务器。
             # 返回的 response 是一个包含模型输出的 LangChain 的 BaseMessage 对象。
             # 实际我们在调试文件中可以看到原始的api返回的json格式，langchain做了封装
+            # LLM 请求/响应原始 JSON → logs/llm_trace.log
+            request_json = json.dumps(
+                [message_to_dict(m) for m in messages],
+                ensure_ascii=False, indent=2, default=str,
+            )
+            llm_trace.info(
+                "══════ iter%d REQUEST session=%s ══════\n%s",
+                i, session_id, request_json,
+            )
+
             llm_t0 = time.time()
             response = llm_with_tools.invoke(messages)
             llm_ms_total += int((time.time() - llm_t0) * 1000)
+
+            response_json = json.dumps(
+                message_to_dict(response), ensure_ascii=False, indent=2, default=str,
+            )
+            llm_trace.info(
+                "══════ iter%d RESPONSE session=%s (%.1fs) ══════\n%s",
+                i, session_id, time.time() - llm_t0, response_json,
+            )
             messages.append(response)
 
             # 从 response 中提取 token 用量
@@ -179,26 +212,23 @@ class RagService:
             raw_tc = response.tool_calls # 模型输出的 tool_calls
             finish = response.response_metadata.get("finish_reason", "?") # 模型结束的原因
 
-            # 调试日志：记录每次迭代的模型响应详情（排查工具调用问题）
-            with open("/home/zhuohao/rag_project/data/agent_debug.log", "a") as f:
-                f.write(f"--- iter{i} session={session_id}, question={question[:80]} ---\n")
-                f.write(f"  finish={finish}, content_preview={repr(content_preview)}\n")
-                f.write(f"  tool_calls={raw_tc}\n")
-                f.write(f"  additional_kwargs={json.dumps(response.additional_kwargs, ensure_ascii=False, default=str)}\n")
-                response_json = json.dumps(
-                    message_to_dict(response), ensure_ascii=False, indent=2, default=str
-                )
-                f.write(f"  response_dict:\n")
-                for line in response_json.split("\n"):
-                    f.write(f"    {line}\n")
-                f.write("\n")
+            # 每轮 LLM 迭代详情
+            logger.debug(
+                "iter%d session=%s finish=%s llm_ms=%d input_tokens=%d output_tokens=%d "
+                "cache_read=%d reasoning=%d content=%s tool_calls=%s",
+                i, session_id, finish, int((time.time() - llm_t0) * 1000),
+                usage.get("input_tokens", 0) if usage else 0,
+                usage.get("output_tokens", 0) if usage else 0,
+                cache_read_tokens, reasoning_tokens,
+                repr(content_preview), raw_tc,
+            )
 
             debug_lines.append(
                 f"iter{i}: finish={finish}, content={repr(content_preview)}, "
                 f"tool_calls={raw_tc}, additional_kwargs={json.dumps(response.additional_kwargs, ensure_ascii=False, default=str)}"
             )
 
-            # 核心逻辑，根据模型返回的 response 判断是否有工具调用。执行不同的分支。
+            # 如果是 tool_calls 结束，说明 Agent 决定调用工具
             if raw_tc:
                 for tc in raw_tc:
                     tool_name = tc.get("name", "")
@@ -241,14 +271,14 @@ class RagService:
             if final_output is None:
                 final_output = "抱歉，处理请求时超时了，请换个方式提问或稍后重试。"
 
-        # 调试日志：写入每次 invoke 的汇总信息
-        with open("/home/zhuohao/rag_project/data/agent_debug.log", "a") as f:
-            f.write(f"--- invoke summary session={session_id} ---\n")
-            f.write(f"  question={question[:80]}\n")
-            f.write(f"  elapsed={t1 - t0:.1f}s, tool_calls={tool_call_count}\n")
-            for dl in debug_lines:
-                f.write(f"  {dl}\n")
-            f.write(f"  final_output={repr(final_output[:200] if final_output else None)}\n\n")
+        # invoke 汇总
+        logger.info(
+            "invoke session=%s elapsed=%.1fs tool_calls=%d llm_ms=%d retrieval_ms=%d "
+            "input_tokens=%d output_tokens=%d cache_read=%d reasoning=%d question=%s final=%s",
+            session_id, t1 - t0, tool_call_count, llm_ms_total, retrieval_ms_total,
+            total_input_tokens, total_output_tokens, cache_read_tokens, reasoning_tokens,
+            question[:80], repr(final_output[:200] if final_output else None),
+        )
 
         save_metrics(
             session_id=session_id,
@@ -264,83 +294,9 @@ class RagService:
             reasoning_tokens=reasoning_tokens,
         )
 
-        history.add_messages(
-            [HumanMessage(content=question), AIMessage(content=final_output)]
-        )
+        history.add_messages([AIMessage(content=final_output)])
 
-        self._maybe_update_summary(session_id)
         return final_output
-
-    def _maybe_update_summary(self, session_id: str) -> None:
-        try:
-            total = MySQLChatMessageHistory.count_messages(session_id)
-            if total <= config.WINDOW_SIZE:
-                return
-
-            overflow_count = total - config.WINDOW_SIZE
-            conn = None
-            try:
-                conn = get_connection()
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT id FROM chat_history WHERE session_id = %s "
-                        "ORDER BY id LIMIT 1 OFFSET %s",
-                        (session_id, overflow_count - 1),
-                    )
-                    row = cur.fetchone()
-                if not row:
-                    return
-                last_overflow_id = row["id"]
-            finally:
-                if conn:
-                    conn.close()
-
-            conn = None
-            try:
-                conn = get_connection()
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "SELECT last_summarized_msg_id FROM chat_summary WHERE session_id = %s",
-                        (session_id,),
-                    )
-                    row = cur.fetchone()
-                last_summarized = row["last_summarized_msg_id"] if row else 0
-            finally:
-                if conn:
-                    conn.close()
-
-            new_msgs = MySQLChatMessageHistory.get_messages_in_range(
-                session_id, last_summarized, last_overflow_id
-            )
-            if not new_msgs:
-                return
-
-            lines = []
-            for msg in new_msgs:
-                role = "用户" if msg.type == "human" else "助手"
-                lines.append(f"{role}：{msg.content}")
-            new_text = "\n".join(lines)
-
-            existing_summary = MySQLChatMessageHistory.get_summary(session_id)
-
-            summary_prompt = f"""你是一个对话摘要助手。请将以下对话历史总结为简洁的摘要，控制在300字以内。摘要应包含：
-1. 用户讨论了哪些主题和问题
-2. 关键的回答要点和重要信息
-3. 有助于后续对话的上下文
-
-现有摘要：
-{existing_summary if existing_summary else "（无）"}
-
-新的对话内容：
-{new_text}
-
-请生成更新后的综合摘要（保留旧摘要中的关键信息，并融入新对话内容，总字数不超过300字）："""
-
-            new_summary = self.summarizer_model.invoke(summary_prompt).content
-            MySQLChatMessageHistory.save_summary(session_id, new_summary, last_overflow_id)
-        except Exception:
-            pass
-
 
 _rag_instance = None
 _rag_lock = threading.Lock()
