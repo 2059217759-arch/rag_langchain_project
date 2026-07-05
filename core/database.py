@@ -158,6 +158,27 @@ def _init_db():
                 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS eval_results (
+                    id              BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    dataset_name    VARCHAR(255) NOT NULL,
+                    question        TEXT NOT NULL,
+                    answer          MEDIUMTEXT,
+                    contexts        JSON,
+                    reference       TEXT,
+                    faithfulness        DOUBLE DEFAULT NULL,
+                    answer_relevancy    DOUBLE DEFAULT NULL,
+                    context_precision   DOUBLE DEFAULT NULL,
+                    context_recall      DOUBLE DEFAULT NULL,
+                    eval_latency_ms     INT DEFAULT 0,
+                    error_message       VARCHAR(1000) DEFAULT NULL,
+                    created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_eval_dataset (dataset_name),
+                    INDEX idx_eval_created (created_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """
+            )
         conn.commit()
     finally:
         if conn:
@@ -200,5 +221,104 @@ def get_parents_by_ids(parent_ids: list[str]) -> dict:
             )
             rows = cur.fetchall()
         return {row["parent_id"]: row for row in rows}
+    finally:
+        conn.close()
+
+
+# ── Eval Results CRUD ──────────────────────────────
+
+def insert_eval_results(rows: list[dict]) -> None:
+    """批量插入评测结果。"""
+    if not rows:
+        return
+    # 确保所有行都有完整的字段
+    _defaults = {
+        "dataset_name": "", "question": "", "answer": None, "contexts": None,
+        "reference": None, "faithfulness": None, "answer_relevancy": None,
+        "context_precision": None, "context_recall": None,
+        "eval_latency_ms": 0, "error_message": None,
+    }
+    normalized = []
+    for row in rows:
+        r = {**_defaults, **row}
+        normalized.append(r)
+
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                INSERT INTO eval_results
+                    (dataset_name, question, answer, contexts, reference,
+                     faithfulness, answer_relevancy, context_precision,
+                     context_recall, eval_latency_ms, error_message)
+                VALUES (%(dataset_name)s, %(question)s, %(answer)s, %(contexts)s,
+                        %(reference)s, %(faithfulness)s, %(answer_relevancy)s,
+                        %(context_precision)s, %(context_recall)s,
+                        %(eval_latency_ms)s, %(error_message)s)
+                """,
+                normalized,
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_eval_results(dataset_name: str | None = None, limit: int = 100) -> list[dict]:
+    """查询评测结果明细。"""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            if dataset_name:
+                cur.execute(
+                    "SELECT * FROM eval_results WHERE dataset_name = %s "
+                    "ORDER BY created_at DESC LIMIT %s",
+                    (dataset_name, limit),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM eval_results ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
+                )
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def get_eval_summary(dataset_name: str | None = None) -> dict:
+    """获取评测指标汇总（平均值）。"""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            if dataset_name:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_samples,
+                        COALESCE(AVG(faithfulness), 0) AS avg_faithfulness,
+                        COALESCE(AVG(answer_relevancy), 0) AS avg_answer_relevancy,
+                        COALESCE(AVG(context_precision), 0) AS avg_context_precision,
+                        COALESCE(AVG(context_recall), 0) AS avg_context_recall,
+                        COALESCE(AVG(eval_latency_ms), 0) AS avg_latency_ms
+                    FROM eval_results
+                    WHERE dataset_name = %s AND error_message IS NULL
+                    """,
+                    (dataset_name,),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        COUNT(*) AS total_samples,
+                        COALESCE(AVG(faithfulness), 0) AS avg_faithfulness,
+                        COALESCE(AVG(answer_relevancy), 0) AS avg_answer_relevancy,
+                        COALESCE(AVG(context_precision), 0) AS avg_context_precision,
+                        COALESCE(AVG(context_recall), 0) AS avg_context_recall,
+                        COALESCE(AVG(eval_latency_ms), 0) AS avg_latency_ms
+                    FROM eval_results
+                    WHERE error_message IS NULL
+                    """
+                )
+            return cur.fetchone()
     finally:
         conn.close()

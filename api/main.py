@@ -15,9 +15,12 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """应用启动/关闭时的生命周期管理。"""
     logger.info("FastAPI 服务启动，预热 RagService 单例...")
-    from core.rag import get_rag_service
-    get_rag_service()
-    logger.info("RagService 单例就绪")
+    try:
+        from core.rag import get_rag_service
+        get_rag_service()
+        logger.info("RagService 单例就绪")
+    except Exception:
+        logger.warning("RagService 预热失败（可能是 ChromaDB/MySQL 未启动），评测功能仍可用")
     yield
     logger.info("FastAPI 服务关闭")
 

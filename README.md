@@ -1,6 +1,6 @@
-# RAG 智能助手 <sup>v2.8.0</sup>
+# RAG 智能助手 <sup>v2.9.0</sup>
 
-基于 FastAPI + LangChain + Streamlit 的 RAG 高并发问答系统，支持文件上传、向量检索、对话记忆和上下文管理。
+基于 FastAPI + LangChain + Streamlit 的 RAG 高并发问答系统，支持文件上传、向量检索、对话记忆、上下文管理和 RAGAS 离线评测。
 
 ## 功能
 
@@ -13,6 +13,7 @@
 - **高并发架构** — FastAPI async 路由 + 线程池执行同步逻辑 + ChromaDB Server + MySQL 连接池
 - **SSE 流式返回** — Agent 问答通过 Server-Sent Events 实时推送，用户无需等待完整响应
 - **多会话管理** — 同一用户可创建多个独立会话（`username_uuid`），多端互不干扰
+- **RAGAS 离线评测** — 完全独立的 CLI 评测工具（`evaluation/` 目录），不依赖后端 API，支持从生产日志抽样或 JSON 数据集评测，Faithfulness / AnswerRelevancy / ContextPrecision / ContextRecall 四项核心指标，结果写入 MySQL
 
 ## 技术栈
 
@@ -29,6 +30,7 @@
 | 重排序 | BCE-Reranker-Base-V1（本地部署） |
 | 认证 | JWT (HS256) + bcrypt |
 | Agent 框架 | 原生 Function Calling（`ChatOpenAI.bind_tools()` + 自写 Agent 循环） |
+| 评测 | RAGAS 0.4.3（Faithfulness / AnswerRelevancy / ContextPrecision / ContextRecall） |
 
 ## 项目结构
 
@@ -48,7 +50,8 @@ rag_project/
 │   └── pages/
 │       ├── chat_page.py        # 智能助手问答页（httpx SSE 流式调用）
 │       ├── upload_page.py      # 文件上传页（httpx 调 FastAPI）
-│       └── metrics_page.py     # 性能监控仪表盘（httpx 调 FastAPI）
+│       ├── metrics_page.py     # 性能监控仪表盘（httpx 调 FastAPI）
+├── evaluation/                  # RAGAS 离线评测（v2.9.0，完全独立于后端）
 ├── core/
 │   ├── config.py               # 全局配置（环境变量 + 常量）
 │   ├── database.py             # MySQL 连接池 + 自动建库建表
@@ -59,6 +62,13 @@ rag_project/
 │   ├── cache.py                 # Redis 缓存层（Embedding / 检索结果 / Reranker 三层缓存）
 │   ├── logging_config.py       # 统一日志配置（RotatingFileHandler + 分级输出）
 │   └── vector_store.py         # ChromaDB (HttpClient) + BM25 + Reranker
+├── evaluation/                  # RAGAS 离线评测（独立模块，不依赖 core/api/app）
+│   ├── config.py               # 独立配置（直接从 .env 读取，不依赖 core.config）
+│   ├── db.py                   # 独立 MySQL 连接（只操作 eval_results 表）
+│   ├── log_parser.py           # 日志解析（parse_llm_trace，提取 Q-A-C 三元组）
+│   ├── dataset_manager.py      # 数据集管理（list/load/save JSON 数据集）
+│   ├── eval_runner.py          # RAGAS 评测执行（封装 evaluate()，LLM + Embeddings 初始化）
+│   └── eval.py                 # CLI 入口（argparse 子命令：run / list / history）
 ├── storage/
 │   └── chat_history.py         # MySQL 对话历史持久化（滑动窗口）
 ├── logs/                       # 应用日志（app.log / error.log / debug.log，自动轮转）
@@ -66,6 +76,7 @@ rag_project/
 │   ├── chroma_db/              # ChromaDB 持久化目录（由 chroma server 管理）
 │   ├── bm25_index.pkl          # BM25 索引磁盘缓存
 │   ├── models/                 # 本地模型（BCE-Reranker-Base-V1）
+│   ├── eval_datasets/          # RAGAS 评测数据集（JSON 格式）
 │   ├── uploads/                # 用户上传的原始文件
 │   └── md5.text                # 文件去重 MD5 记录
 └── .env                        # 环境变量（API Key、数据库连接等）
@@ -185,6 +196,22 @@ graph TB
 | output_tokens | INT | 输出 token 数 |
 | cache_read_tokens | INT | 缓存命中 token 数 |
 | reasoning_tokens | INT | 推理 token 数 |
+
+### eval_results
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | BIGINT PK | 结果 ID |
+| dataset_name | VARCHAR(255) INDEX | 数据集名称 |
+| question | TEXT | 评测问题 |
+| answer | MEDIUMTEXT | RAG 生成的答案 |
+| contexts | JSON | 检索到的上下文列表 |
+| reference | TEXT | 参考答案（可选） |
+| faithfulness | DOUBLE | 忠实度得分（0-1） |
+| answer_relevancy | DOUBLE | 答案切题度得分（0-1） |
+| context_precision | DOUBLE | 上下文精准度得分（0-1） |
+| context_recall | DOUBLE | 上下文召回率得分（0-1） |
+| eval_latency_ms | INT | 单条评测耗时（ms） |
+| error_message | VARCHAR(1000) | 错误信息（评测失败时） |
 
 ## API 文档
 
@@ -642,3 +669,154 @@ export LOG_LEVEL=DEBUG
 
 三者记录同一批指标（耗时、token、工具调用），但用途不同：日志用于定位问题，metrics 用于量化分析。
 
+## RAGAS 离线评测（v2.9.0）
+
+评测模块位于 `evaluation/` 目录，作为**完全独立的 CLI 工具**运行，不依赖 FastAPI 后端、JWT 鉴权或 Streamlit 前端。所有代码集中在 `evaluation/` 下，不 import 任何 `core/`、`api/`、`app/` 模块。
+
+### 数据流
+
+```
+logs/llm_trace.log ──export──► data/eval_datasets/xxx.json ──run──► RAGAS evaluate()
+                                                                     (DeepSeek 作评测 LLM)
+                                                                           │
+                                                              ┌────────────┴────────────┐
+                                                              ▼                         ▼
+                                                       MySQL eval_results         JSON 汇总文件
+                                                        (持久化明细)           (data/eval_results/)
+```
+
+### 四大核心指标
+
+| 指标 | 含义 | 需要 Ground Truth | 说明 |
+|------|------|:---:|------|
+| **Faithfulness** | 答案是否忠于检索上下文 | ❌ | 检测幻觉：将答案分解为声明，逐一验证是否被上下文支持 |
+| **AnswerRelevancy** | 答案是否切题 | ❌ | 从答案反推问题，计算与原问题的语义相似度 |
+| **ContextPrecision** | 检索到的上下文是否相关 | ❌ | 检索精准度：上下文中无关内容占比 |
+| **ContextRecall** | 相关信息是否被检索到 | ✅ | 检索召回率：参考答案中的信息有多少出现在上下文中 |
+
+> 前三个指标**不需要 Ground Truth**，可直接对线上真实问答评测。ContextRecall 需要参考答案。
+
+### 工作流
+
+```
+logs/llm_trace.log ──export──► data/eval_datasets/xxx.json ──run──► MySQL eval_results
+                                                                   + JSON 汇总文件
+```
+
+两步操作，各司其职：`export` 负责从日志提取样本，`run` 负责对数据集执行 RAGAS 评测。
+
+### CLI 使用
+
+```bash
+# 1. 从生产日志导出数据集
+python -m evaluation.eval export --name my_dataset --limit 100
+
+# 2. 对数据集执行评测
+python -m evaluation.eval run --dataset-name my_dataset --metrics faithfulness,answer_relevancy,context_precision
+
+# 辅助命令
+python -m evaluation.eval list                     # 列出所有数据集
+python -m evaluation.eval history --dataset-name sample  # 查看历史评测
+```
+
+**export 子命令：**
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--name NAME` | 数据集名称 | `export_YYYYMMDD_HHMMSS` |
+| `--limit N` | 从日志抽取条数 | `100` |
+| `--session-id SID` | 筛选指定会话 | — |
+| `--log-path PATH` | 日志文件路径 | `logs/llm_trace.log` |
+
+**run 子命令：**
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `--dataset-name NAME` | 数据集名称（**必填**） | — |
+| `--metrics M1,M2,...` | 评测指标，逗号分隔 | `faithfulness,answer_relevancy,context_precision` |
+| `--output-dir DIR` | 汇总 JSON 输出目录 | `data/eval_results/` |
+
+### 数据集来源
+
+数据集的唯一入口是 `data/eval_datasets/*.json`，有两种创建方式：
+
+**方式一（推荐）：从生产日志导出**
+
+系统运行期间 `logs/llm_trace.log` 会记录所有问答的完整上下文。导出后自动提取发生过检索的会话：
+
+```bash
+python -m evaluation.eval export --name weekly_eval --limit 100
+```
+
+导出的 JSON 中 `reference` 字段为空，如需 ContextRecall 评测需手动补充参考答案。
+
+**方式二：手工编写 JSON**
+
+在 `data/eval_datasets/` 下放置 JSON 文件：
+
+```json
+[
+  {
+    "question": "RAG 系统中 RRF 融合的作用是什么？",
+    "answer": "RRF 通过将 BM25 和向量检索的排名融合...",
+    "contexts": ["BM25 是基于词频的稀疏检索...", "向量检索利用稠密向量..."],
+    "reference": "RRF 是一种融合排序算法，合并多路检索结果以提升召回。"
+  }
+]
+```
+
+`answer`、`contexts`、`reference` 均可选，`reference` 仅在启用 ContextRecall 时需要。
+
+### 评测 LLM 与 Embedding
+
+RAGAS 内部评测使用 DeepSeek（`llm_factory(provider="openai")`）和 DashScope `text-embedding-v4`，直接复用项目 `.env` 中已有的 API Key，无需额外配置。
+
+### 模块结构
+
+```
+evaluation/
+├── config.py            # 独立配置，load_dotenv() 读取 .env
+├── db.py                # 独立 MySQL 连接（pymysql），只操作 eval_results 表
+├── log_parser.py        # 日志解析（parse_llm_trace → Q-A-C 三元组）
+├── dataset_manager.py   # 数据集管理（list/load/save JSON）
+├── eval_runner.py       # RAGAS 评测执行（EvalRunner，封装 evaluate() 调用）
+└── eval.py              # CLI 入口（argparse: run / list / history）
+```
+
+### 结果输出
+
+评测结果**双写**：
+
+1. **MySQL `eval_results` 表** — 每条样本的详细得分、耗时、错误信息
+2. **JSON 文件** — 汇总数据写入 `data/eval_results/{dataset_name}.json`
+
+控制台实时打印汇总：
+
+```
+==================================================
+📊 评测完成: sample
+==================================================
+  总样本数:    3
+  成功:        3
+  失败:        0
+  总耗时:      45230ms
+──────────────────────────────────────────────────
+  faithfulness          : 0.6667 █████████████
+  answer_relevancy      : 0.9967 ████████████████████
+  context_precision     : 0.8500 █████████████████
+==================================================
+```
+
+### 架构特点
+
+- **完全独立** — 零依赖 `core/`、`api/`、`app/`，可单独复制到其他项目使用
+- **离线运行** — 评测过程不影响线上问答服务
+- **定期抽样** — 配合 cron 定时从日志抽样，持续监控质量趋势
+  ```bash
+  # 示例：每天凌晨 3 点自动评测前一天的日志
+  0 3 * * * cd /path/to/rag_project && python -m evaluation.eval run --source logs --limit 100
+  ```
+- **双数据源** — 线上日志（真实） + JSON 数据集（标注 Ground Truth）
+- **结果持久化** — MySQL 存明细（可查询、可对比），JSON 存汇总（可版本控制）
+
+## 配置参考

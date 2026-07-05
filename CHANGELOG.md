@@ -1,5 +1,26 @@
 # Changelog
 
+## [v2.9.0] — 2026-07-05
+
+### 新增
+
+- **独立评测模块**：`evaluation/` 目录，完全解耦于后端（零依赖 `core/`/`api/`/`app/`），CLI 方式运行
+- **`export` 子命令**：从 `llm_trace.log` 解析真实问答对，导出为 JSON 数据集
+- **`run` / `list` / `history` 子命令**：评测执行、数据集管理、历史查询
+
+### 移除
+
+- **`api/routes/evaluation.py`**：评测不再通过 FastAPI 暴露
+- **`app/pages/eval_page.py`**：Streamlit 评测面板移除
+
+### 变更
+
+- **`api/main.py`**：移除 evaluation 路由注册
+- **`api/schemas.py`**：移除 `EvalRunRequest` / `EvalRunResponse` / `EvalResultsResponse`
+- 评测结果仍写入 MySQL `eval_results` 表，同时输出 JSON 汇总到 `data/eval_results/`
+
+---
+
 ## [v2.8.0] — 2026-07-03
 
 ### 移除
